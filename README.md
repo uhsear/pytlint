@@ -215,3 +215,10 @@ Built by [Asir Khan](https://www.linkedin.com/in/asir-khan-310317264/).
 ## License
 
 MIT.
+
+## Related
+
+Other single-file tools in this portfolio that pair with this one:
+
+- [arcade-rule-deploy](https://github.com/uhsear/arcade-rule-deploy) - the Arcade equivalent, checked before it reaches a geodatabase
+- [jobharness](https://github.com/uhsear/jobharness) - what the toolbox should run under when it is scheduled
