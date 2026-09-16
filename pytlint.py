@@ -40,8 +40,12 @@ from __future__ import print_function
 
 import argparse
 import ast
+import contextlib
+import io
 import json
+import os
 import sys
+import tempfile
 
 from pathlib import Path
 
@@ -193,7 +197,37 @@ def _self_assignments(cls):
 
 
 def _arg_names(fn):
-    return tuple(arg.arg for arg in fn.args.args)
+    """The arguments arcpy fills positionally.
+
+    posonlyargs is in here because a "def execute(self, parameters, messages, /)"
+    is called exactly the way arcpy calls it. Reading args.args alone left that
+    list empty and reported a working signature as the wrong one.
+    """
+    return tuple(arg.arg for arg in fn.args.posonlyargs + fn.args.args)
+
+
+def _signature_text(fn):
+    """The argument list as it is written, for the message only.
+
+    _arg_names deliberately sees only the positional arguments, because those
+    are the ones arcpy fills, and the comparison has to stay that way. Building
+    the message from the same list printed "execute(self)" for a
+    "def execute(self, *args)", which sends the reader to a line that does not
+    say what the finding says it says.
+    """
+    args = fn.args
+    parts = [arg.arg for arg in args.posonlyargs]
+    if parts:
+        parts.append("/")
+    parts.extend(arg.arg for arg in args.args)
+    if args.vararg is not None:
+        parts.append("*" + args.vararg.arg)
+    elif args.kwonlyargs:
+        parts.append("*")
+    parts.extend(arg.arg for arg in args.kwonlyargs)
+    if args.kwarg is not None:
+        parts.append("**" + args.kwarg.arg)
+    return ", ".join(parts)
 
 
 def _param_arg(fn, position=1):
@@ -396,7 +430,8 @@ def _check_signatures(methods, out):
         out.append(Finding(code, fn.lineno,
                            "%s(%s) does not match %s(%s), which is the "
                            "signature arcpy calls"
-                           % (name, ", ".join(actual), name, ", ".join(expected))))
+                           % (name, _signature_text(fn), name,
+                              ", ".join(expected))))
 
 
 def _check_parameters(cls_name, params, out):
@@ -441,12 +476,15 @@ def _check_tool_class(cls, out, is_toolbox=False):
     methods = _methods(cls)
     assigns = _self_assignments(cls)
 
-    for attr in ("label", "description"):
+    # One message for both attributes claimed both consequences whichever one
+    # was missing, so a tool with a label was told its dialog shows the class
+    # name. The consequence has to match the attribute that is actually absent.
+    for attr, consequence in (("label", "the dialog shows the class name"),
+                              ("description", "the help pane is empty")):
         if attr not in assigns:
             out.append(Finding("PYT010", cls.lineno,
-                               "%s never assigns self.%s, so the dialog shows "
-                               "the class name and the help pane is empty"
-                               % (cls.name, attr)))
+                               "%s never assigns self.%s, so %s"
+                               % (cls.name, attr, consequence)))
 
     if "canRunInBackground" in assigns:
         out.append(Finding("PYT017", assigns["canRunInBackground"].lineno,
@@ -714,6 +752,62 @@ GOOD_TOOL = '''class Demo(object):
 '''
 
 
+
+# Not Python at all. A .pyt that a merge tool filled with markup, or a path that
+# picked up the wrong file, has to be reported rather than skipped.
+XML_FILE = '''<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <dataIdInfo><idAbs>Parcel centroids</idAbs></dataIdInfo>
+</metadata>
+'''
+
+# A toolbox that would take the process down with it if anything imported it.
+# The %s is a sentinel path: the first line writes it, so the file appearing is
+# proof that the module level ran, and the file staying absent is proof it did
+# not. The lines after it are what a toolbox does at import time in the field,
+# which is why importing one to inspect it is not an option.
+LANDMINE = '''import arcpy
+import this_module_is_not_installed_anywhere
+
+with open(r"%s", "w") as _handle:
+    _handle.write("the module level of the toolbox ran")
+
+raise RuntimeError("a linter that imports a toolbox reaches this line")
+
+CONNECTION = arcpy.ArcSDESQLExecute("sde:not-a-real-server")
+_BROKEN = 1 / 0
+
+
+class Toolbox(object):
+    def __init__(self):
+        self.label = "Landmine"
+        self.alias = "landmine"
+        self.description = "Never import me"
+        self.tools = [Landmine]
+
+
+class Landmine(object):
+    def __init__(self):
+        self.label = "Landmine"
+        self.description = "Nothing in here runs"
+
+    def isLicensed(self):
+        return True
+
+    def getParameterInfo(self):
+        p0 = arcpy.Parameter(name="in_fc", parameterType="Required",
+                             direction="Input")
+        return [p0]
+
+    def updateMessages(self, parameters):
+        if parameters[2].value:
+            parameters[2].setErrorMessage("past the end")
+
+    def execute(self, parameters, messages):
+        arcpy.AddMessage(parameters[0].valueAsText)
+'''
+
+
 def _pyt(body, tools="Demo"):
     """Wrap a tool class in a valid Toolbox, so only the rule under test fires."""
     return HEAD % tools + body
@@ -732,6 +826,14 @@ def _lines_for(source, code):
 
 def _message_for(source, code):
     return [f.message for f in check_source(source) if f.code == code][0]
+
+
+def _run(argv):
+    """main(argv) with its streams captured. Returns (status, stdout, stderr)."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        status = main(argv)
+    return status, out.getvalue(), err.getvalue()
 
 
 def _fires(source, code):
@@ -1005,6 +1107,11 @@ def self_test():
     check(_fires(soft_fail.replace("            return  #@",
                                    "            return None  #@"), "PYT006"),
           "an explicit return None is the same defect")
+    check(_silent(soft_fail.replace("            return",
+                                    "            return self.cleanup()"),
+                  "PYT006"),
+          "a return that hands back a value is outside the documented scope "
+          "and is not reported")
 
     # ---- isLicensed
     no_licence = _pyt('''class Demo(object):  #@
@@ -1065,6 +1172,22 @@ def self_test():
           "a class with neither label nor description fires twice on the class line")
     check(_silent(CLEAN, "PYT010"),
           "a labelled tool inside a labelled Toolbox is silent")
+    messages = [f.message for f in check_source(unlabelled) if f.code == "PYT010"]
+    check(sorted(m.split(", so ")[1] for m in messages) ==
+          ["the dialog shows the class name", "the help pane is empty"],
+          "each of the two names its own consequence, not both  <-- pinned defect")
+    only_label = _pyt('''class Demo(object):  #@
+    def __init__(self):
+        self.label = "x"
+
+    def getParameterInfo(self):
+        return []
+
+    def execute(self, parameters, messages):
+        pass
+''')
+    check(_message_for(only_label, "PYT010").endswith("the help pane is empty"),
+          "a tool that has a label is not told its dialog shows the class name")
     check(_lines_for(unlabelled, "PYT017") == [_marked(unlabelled) + 2],
           "canRunInBackground fires on its own assignment line")
     check(_silent(CLEAN, "PYT017"),
@@ -1177,6 +1300,328 @@ class Toolbox(object):  #@
     check(_lines_for("\ufeff" + broken, "PYT000") == [1],
           "a real syntax error behind a byte order mark still reports line 1")
 
+    # ---- the small readers, on the shapes only an odd toolbox produces
+    subscripted_call = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        return []
+
+    def execute(self, parameters, messages):
+        messages[0].addErrorMessage("boom")
+        return
+''')
+    check(_silent(subscripted_call, "PYT006"),
+          "a call on a subscript has no dotted name and is not read as AddError")
+
+    no_direction = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        p0 = arcpy.Parameter(displayName="A", name="a", parameterType="Required")
+        p1 = arcpy.Parameter(displayName="B", name="a", parameterType="Required")  #@
+        return [p0, p1]
+''')
+    check(_fires(no_direction, "PYT002"),
+          "a Parameter that omits direction is still read for its name")
+    check(_silent(no_direction, "PYT015"),
+          "an absent keyword is not reported as an undocumented value")
+
+    class_attribute = _pyt('''class Demo(object):  #@
+    category = "Editing"
+    description = "not self.description"
+
+    def isLicensed(self):
+        return True
+''')
+    check(_lines_for(class_attribute, "PYT009") == [_marked(class_attribute)] * 3,
+          "a class-level assignment is not mistaken for a method")
+    check(len(_lines_for(class_attribute, "PYT010")) == 2,
+          "a class attribute named description is not self.description")
+
+    no_args = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        p0 = arcpy.Parameter(name="a", parameterType="Required", direction="Output")  #@
+        return [p0]
+
+    def updateMessages(self):
+        pass
+
+    def execute(self):
+        pass
+''')
+    check(_silent(no_args, "PYT001"),
+          "a hook that takes no parameter list is not searched for an overrun")
+    check(_fires(no_args, "PYT005"),
+          "an execute that takes no parameter list still leaves the Output "
+          "unwritten, and is still reported for it")
+    check(sorted(set(f.code for f in check_source(no_args))) ==
+          ["PYT005", "PYT007", "PYT009", "PYT010", "PYT011", "PYT016"],
+          "both wrong signatures and the missing method are still reported")
+
+    star_args = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        return []
+
+    def execute(self, *args, **kwargs):  #@
+        pass
+''')
+    check(_fires(star_args, "PYT011"),
+          "an execute that takes only *args still fires")
+    check("execute(self, *args, **kwargs)" in _message_for(star_args, "PYT011"),
+          "the message quotes the signature the file really has  <-- pinned defect")
+
+    kwonly = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        return []
+
+    def execute(self, parameters, *, messages=None):  #@
+        pass
+''')
+    check("execute(self, parameters, *, messages)" in _message_for(kwonly, "PYT011"),
+          "a keyword-only argument is quoted as keyword-only  <-- pinned defect")
+
+    posonly = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        return []
+
+    def execute(self, parameters, messages, /):
+        pass
+''')
+    check(_silent(posonly, "PYT011"),
+          "a positional-only execute is the signature arcpy calls and is "
+          "silent  <-- pinned defect")
+    short_posonly = posonly.replace("def execute(self, parameters, messages, /):",
+                                    "def execute(self, parameters, /):  #@")
+    check(_fires(short_posonly, "PYT011"),
+          "a positional-only execute that is short of an argument still fires")
+    check("execute(self, parameters, /)" in _message_for(short_posonly, "PYT011"),
+          "the message marks the arguments as positional-only")
+
+    computed_write = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        p0 = arcpy.Parameter(name="out", parameterType="Derived", direction="Output")  #@
+        return [p0]
+
+    def execute(self, parameters, messages):
+        index = 0
+        parameters[index].value = "x"
+''')
+    check(_fires(computed_write, "PYT005"),
+          "a write through a computed index does not count as writing the Output")
+
+    surplus = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        p0 = arcpy.Parameter(name="a", parameterType="Required", direction="Input")
+        p1 = arcpy.Parameter(name="out", parameterType="Derived", direction="Output")
+        return [p0]
+
+    def execute(self, parameters, messages):
+        arcpy.AddMessage("nothing")
+''')
+    check(_silent(surplus, "PYT005"),
+          "a Parameter built past the end of the returned list holds no index "
+          "and is not reported as unwritten")
+
+    augmented = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        params = []
+        params += [arcpy.Parameter(name="a", parameterType="Required",
+                                   direction="Input")]
+        return params
+
+    def updateMessages(self, parameters):
+        if parameters[7].value:
+            pass
+''')
+    check(_silent(augmented, "PYT001"),
+          "a list grown with += is not counted either  <-- pinned defect")
+
+    # The name returned has to be a bare name, not a literal list, or the count
+    # never reaches _literal_lengths and the assertion cannot tell a hit from a
+    # miss. self.params holds three, params holds one, and the index under test
+    # is only silent if the attribute was counted by mistake.
+    attribute_list = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        self.params = [1, 2, 3]
+        params = [arcpy.Parameter(name="a", parameterType="Required",
+                                  direction="Input")]
+        return params
+
+    def updateMessages(self, parameters):
+        if parameters[2].value:  #@
+            pass
+''')
+    check(_fires(attribute_list, "PYT001"),
+          "a literal list assigned to self.something does not become the count")
+
+    # Two literal lists under one name, the Esri shape where a branch adds
+    # parameters. The longer one is the count, so an index valid on that branch
+    # is never reported.
+    rebound = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        params = [arcpy.Parameter(name="a", parameterType="Required",
+                                  direction="Input")]
+        if self.extended:
+            params = [arcpy.Parameter(name="a", parameterType="Required",
+                                      direction="Input"),
+                      arcpy.Parameter(name="b", parameterType="Optional",
+                                      direction="Input"),
+                      arcpy.Parameter(name="c", parameterType="Optional",
+                                      direction="Input")]
+        return params
+
+    def updateMessages(self, parameters):
+        if parameters[2].value:
+            pass
+''')
+    check(_silent(rebound, "PYT001"),
+          "the longest of two literal lists bound to one name is the count")
+    check(_fires(rebound.replace("if parameters[2].value:",
+                                 "if parameters[3].value:  #@"), "PYT001"),
+          "an index past even the longest of them still fires")
+
+    # Everything below the Parameter reader depends on it collecting only real
+    # Parameter calls. A helper call in the same method used to be indistinguishable
+    # from one, so the count of collected parameters is what is asserted here.
+    other_calls = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        fields = arcpy.ListFields(self.template)
+        p0 = arcpy.Parameter(name="a", parameterType="Required", direction="Input")
+        p0.filter.list = sorted(f.name for f in fields)
+        return [p0]
+
+    def execute(self, parameters, messages):
+        parameters[0].value = "x"
+''')
+    collected = _collect_parameters(_methods(
+        ast.parse(other_calls).body[2])["getParameterInfo"])[0]
+    check([p.name for p in collected] == ["a"],
+          "a helper call beside the Parameter is not collected as a parameter")
+    check(_silent(other_calls, "PYT015"),
+          "and it is not reported for the keywords a Parameter would have had")
+
+    plain_assign = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        p0 = arcpy.Parameter(name="a", parameterType="Required", direction="Input")
+        return [p0]
+
+    def updateMessages(self, parameters):
+        total = 1
+        parameters[0].value = total  #@
+''')
+    check(_fires(plain_assign, "PYT004"),
+          "an ordinary assignment beside it does not hide the .value write")
+
+    spaced_return = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        return []
+
+    def execute(self, parameters, messages):
+        arcpy.AddError("no input")
+        count = 1
+        return  #@
+''')
+    check(_fires(spaced_return, "PYT006"),
+          "a statement between the AddError and the return does not hide it")
+
+    # Python 3.8 wrapped a subscript in an ast.Index node and 3.9 dropped it.
+    # ast.Index still exists on this interpreter but hands back its own
+    # argument, so the only way to reach the 3.8 branch is to build that shape.
+    class Index(object):
+        def __init__(self, value):
+            self.value = value
+
+    class Subscript38(object):
+        def __init__(self, slice_):
+            self.slice = slice_
+
+    check(_const_index(Subscript38(Index(ast.Constant(value=3)))) == 3,
+          "the Python 3.8 Index wrapper is unwrapped to the index inside it")
+    check(_const_index(Subscript38(Index(ast.Constant(value=-1)))) is None,
+          "a negative index inside a 3.8 Index wrapper is still skipped")
+    check(_const_index(Subscript38(Index(ast.Constant(value=True)))) is None,
+          "True is not read as the index 1")
+
+    # ---- self.tools shapes that are not a literal list of names
+    computed_tools = '''import arcpy
+
+
+class Toolbox(object):
+    def __init__(self):
+        self.label = "t"
+        self.alias = "t"
+        self.description = "t"
+        self.tools = discover_tools()
+'''
+    check(_silent(computed_tools, "PYT013"),
+          "self.tools built by a call is an assignment and is not reported missing")
+    check(_silent(computed_tools, "PYT008"),
+          "no tool name is invented from a call, so nothing is reported undefined")
+
+    string_tool = _pyt(GOOD_TOOL, tools='Demo, "Other"')
+    check(_silent(string_tool, "PYT008"),
+          "a string in self.tools is not a class name and is not reported")
+
+    # ---- the renderers
+    finding = check_source(bad_index)[0]
+    check(finding.as_dict()["code"] == finding.code
+          and "path" not in finding.as_dict(),
+          "a finding renders to a dict without a path when none is given")
+    check(finding.as_dict("A.pyt")["path"] == "A.pyt",
+          "the path is carried into the dict when one is given")
+    check(sorted(finding.as_dict("A.pyt")) ==
+          ["code", "line", "message", "path", "severity"],
+          "the dict carries exactly the five documented keys")
+    check(finding.code in repr(finding) and str(finding.line) in repr(finding),
+          "a finding prints its own code and line")
+    sample = _collect_parameters(_methods(
+        ast.parse(CLEAN).body[2])["getParameterInfo"])[0][0]
+    check("in_fc" in repr(sample) and "Required" in repr(sample),
+          "a parameter prints its own name and type")
+
+    # ---- the harness itself
+    try:
+        _marked("x = 1\n")
+        marker_guarded = False
+    except AssertionError:
+        marker_guarded = True
+    check(marker_guarded, "a test source with no marker is refused by the harness")
+
+    # ---- a credential in the toolbox stays in the toolbox
+    # A .pyt with a hard-coded password in it is depressingly common, and the
+    # findings from one get pasted into a ticket. Nothing this tool prints may
+    # carry a line of the source: it quotes names, values of the two keywords it
+    # checks, and signatures, and the syntax message is exc.msg, never exc.text.
+    secret = "Tr0ub4dor-3-in-the-source"
+    with_secret = _pyt('''class Demo(object):
+    def getParameterInfo(self):
+        p0 = arcpy.Parameter(name="a", parameterType="Required", direction="Input")
+        return [p0]
+
+    def updateMessages(self, parameters):
+        if parameters[3].value:
+            pass
+
+    def execute(self, parameters, messages):
+        arcpy.CreateDatabaseConnection_management("o", "s", "SQL_SERVER", "h",
+                                                  "DATABASE_AUTH", "gis",
+                                                  "SECRET")
+''').replace("SECRET", secret)
+    rendered = " ".join(format_finding(f, "Secrets.pyt")
+                        for f in check_source(with_secret))
+    check("PYT001" in rendered and secret not in rendered,
+          "a password in the source reaches no finding this tool prints")
+    check(secret not in json.dumps([f.as_dict("Secrets.pyt")
+                                    for f in check_source(with_secret)]),
+          "and none of it reaches the JSON output either")
+    broken_secret = '''x = = "%s"
+
+
+class Toolbox(object):
+    pass
+''' % secret
+    check([f.code for f in check_source(broken_secret)] == ["PYT000"]
+          and secret not in _message_for(broken_secret, "PYT000"),
+          "the syntax message carries the parser's words, never the line it "
+          "failed on")
+
     # ---- selecting and ignoring codes
     findings = check_source(bad_index)
     check(len(findings) > 1, "the index example trips other rules as well")
@@ -1216,6 +1661,8 @@ class Toolbox(object):  #@
     check(parse_codes("pyt001", "--select") == {"PYT001"},
           "a lower case code is accepted")
     check(parse_codes("", "--select") == set(), "an empty code list selects nothing")
+    check(parse_codes("PYT001, ,PYT006", "--select") == {"PYT001", "PYT006"},
+          "a stray comma in a code list is skipped, not read as a code")
     raises(lambda: parse_codes("PYT999", "--select"), "an unknown code raises")
 
     # ---- argument handling
@@ -1236,6 +1683,160 @@ class Toolbox(object):  #@
     check(_parse(["a.pyt", "b.pyt"]).paths == ["a.pyt", "b.pyt"],
           "more than one path is read")
     check(_parse([]).paths == [], "no path at all parses, and main turns it into a usage error")
+
+    # ---- end to end through main(), against files on disk
+    # main() is the only part of this tool that opens a file, so it is the only
+    # part the assertions above cannot reach. Nothing below needs arcpy, a
+    # network or a database. The files are written into a temporary directory
+    # that is removed when the block ends.
+    with tempfile.TemporaryDirectory(prefix="pytlint-selftest-") as tmp:
+
+        def write(name, text):
+            full = os.path.join(tmp, name)
+            with open(full, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            return full
+
+        clean_file = write("Clean.pyt", CLEAN)
+        error_file = write("Error.pyt", bad_index)
+        warn_file = write("Warn.pyt", no_licence)
+        broken_file = write("Broken.pyt", broken)
+        not_python = write("Notes.xml", XML_FILE)
+        missing_file = os.path.join(tmp, "NoSuchToolbox.pyt")
+        binary_file = os.path.join(tmp, "Binary.pyt")
+        with open(binary_file, "wb") as handle:
+            handle.write(b"\xff\xfe\x00c\x00l\x00a\x00s\x00s")
+
+        # A toolbox whose module level writes a file and then throws. Importing
+        # it to inspect it is the thing this tool exists not to do, and the
+        # sentinel is how that claim is proved instead of described.
+        sentinel = os.path.join(tmp, "the-toolbox-ran.txt")
+        landmine = write("Landmine.pyt", LANDMINE % sentinel)
+
+        status, out, err = _run([clean_file])
+        check(status == 0, "a clean toolbox exits 0 through main")
+        check("nothing to report" in out,
+              "a clean toolbox says so instead of printing nothing at all")
+        check(err == "", "a clean run writes nothing to stderr")
+
+        status, out, err = _run([warn_file])
+        check(status == 0, "a warning-only toolbox exits 0 through main")
+        check("PYT007 warning:" in out, "the warning is still printed")
+        status, out, err = _run([warn_file, "--strict"])
+        check(status == 1, "--strict turns that same warning into exit 1")
+
+        status, out, err = _run([error_file])
+        check(status == 1, "an error-severity finding exits 1 through main")
+        check("PYT001 error:" in out, "the error is printed as an error")
+        check(out.startswith(error_file + ":"),
+              "the printed line starts with the path that was given")
+
+        status, out, err = _run([missing_file])
+        check(status == 2, "a path that is not there exits 2")
+        check("cannot read" in err and out == "",
+              "the read failure goes to stderr and leaves stdout empty")
+
+        status, out, err = _run([tmp])
+        check(status == 2, "a directory instead of a file exits 2")
+
+        status, out, err = _run([binary_file])
+        check(status == 2, "a file that is not text at all exits 2")
+
+        status, out, err = _run([not_python])
+        check(status == 1, "a file that is not Python is reported, not skipped")
+        check("PYT000 error:" in out, "it is reported as a syntax finding")
+
+        status, out, err = _run([broken_file])
+        check(status == 1, "a toolbox with a syntax error exits 1")
+        check(out.count("PYT000") == 1 and out.count("\n") == 1,
+              "a syntax error reports one finding and stops, it does not crash")
+
+        status, out, err = _run([landmine])
+        check(status == 1, "a toolbox that would throw on import is still linted")
+        check("PYT001 error:" in out,
+              "the findings inside it are real findings, not an import error")
+        check(not os.path.exists(sentinel),
+              "no module-level line of the toolbox ran  <-- the headline claim")
+
+        # ---- --json
+        status, out, err = _run([error_file, "--json"])
+        payload = json.loads(out)
+        check(status == 1, "--json does not change the exit code")
+        check(sorted(payload) == ["errors", "findings", "warnings"],
+              "the JSON document carries exactly the three documented keys")
+        check(payload["findings"] and all(
+            sorted(row) == ["code", "line", "message", "path", "severity"]
+            for row in payload["findings"]),
+              "every JSON finding carries the five documented keys")
+        check(payload["errors"] == len([r for r in payload["findings"]
+                                        if r["severity"] == "error"]),
+              "the error count matches the rows marked error")
+        check(payload["warnings"] == len([r for r in payload["findings"]
+                                          if r["severity"] == "warning"]),
+              "the warning count matches the rows marked warning")
+        check(all(row["path"] == error_file for row in payload["findings"]),
+              "every JSON row carries the path it came from")
+        check(json.loads(_run([clean_file, "--json"])[1])["findings"] == [],
+              "a clean toolbox produces an empty findings list, not no output")
+
+        # ---- --select and --ignore, through main and not only through the filter
+        status, out, err = _run([error_file, "--select", "PYT001"])
+        check(status == 1 and out.count("PYT001") == out.count("PYT"),
+              "--select prints the named code and nothing else")
+        status, out, err = _run([error_file, "--select", "PYT007"])
+        check(status == 0, "--select down to a warning drops the exit code to 0")
+        status, out, err = _run([error_file, "--ignore", "PYT001"])
+        check("PYT001" not in out and "PYT" in out,
+              "--ignore drops the named code and keeps the rest")
+        status, out, err = _run([error_file, "--select", "pyt001,PYT007"])
+        check("PYT001" in out and "PYT007" in out,
+              "--select reads a lower case code in a list")
+        status, out, err = _run([error_file, "--select", "PYT001",
+                                 "--ignore", "PYT001"])
+        check(status == 0 and "nothing to report" in out,
+              "selecting and ignoring the same code leaves nothing")
+
+        # ---- more than one path at a time
+        status, out, err = _run([clean_file, error_file])
+        check(status == 1, "the worst exit code of several files wins")
+        check(error_file in out and clean_file not in out,
+              "a file with nothing to report stays quiet beside one that has "
+              "findings, so the output is only the lines to act on")
+        status, out, err = _run([error_file, missing_file])
+        check(status == 2,
+              "a file that cannot be read outranks a finding in one that could")
+        check("PYT001" in out,
+              "the readable file is still reported when another one failed")
+        status, out, err = _run([clean_file, clean_file])
+        check("2 file(s) checked" in out, "the count in the summary is the file count")
+
+        # ---- usage errors
+        check(_run([])[0] == 64, "no path at all is a usage error")
+        check(_run([clean_file, "--select", "PYT999"])[0] == 64,
+              "an unknown code in --select is a usage error")
+        check(_run([clean_file, "--ignore", "PYT999"])[0] == 64,
+              "an unknown code in --ignore is a usage error")
+        check("--list-rules" in _run([clean_file, "--ignore", "XX"])[2],
+              "the usage error names the flag that can list the real codes")
+
+        # ---- --list-rules
+        status, out, err = _run(["--list-rules"])
+        check(status == 0, "--list-rules exits 0")
+        check(all(code in out for code in ALL_CODES),
+              "--list-rules prints every rule this tool implements")
+        check(out.count("\n") == len(RULES),
+              "--list-rules prints one line per rule and nothing else")
+        check(all(severity in out and text in out
+                  for _, severity, text in RULES),
+              "--list-rules prints the severity and the rule beside each code, "
+              "not the code on its own")
+
+        # ---- a byte order mark on disk, which is how Windows editors save one
+        bom_file = os.path.join(tmp, "Bom.pyt")
+        with open(bom_file, "wb") as handle:
+            handle.write(b"\xef\xbb\xbf" + CLEAN.encode("utf-8"))
+        check(_run([bom_file])[0] == 0,
+              "a toolbox saved with a byte order mark still reads as clean")
 
     print("-" * 68)
     total = passed[0] + len(failed)

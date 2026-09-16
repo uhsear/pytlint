@@ -40,18 +40,40 @@ PASS  a class named twice in self.tools is linted once  <-- pinned defect
 ...
 PASS  a leading UTF-8 byte order mark is not a syntax error  <-- pinned defect
 ...
-PASS  no path at all parses, and main turns it into a usage error
+PASS  the message quotes the signature the file really has  <-- pinned defect
+PASS  a keyword-only argument is quoted as keyword-only  <-- pinned defect
+PASS  a positional-only execute is the signature arcpy calls and is silent  <-- pinned defect
+...
+PASS  a list grown with += is not counted either  <-- pinned defect
+...
+PASS  a path that is not there exits 2
+PASS  a directory instead of a file exits 2
+PASS  a file that is not text at all exits 2
+PASS  a syntax error reports one finding and stops, it does not crash
+PASS  no module-level line of the toolbox ran  <-- the headline claim
+PASS  the JSON document carries exactly the three documented keys
+PASS  every JSON finding carries the five documented keys
+...
+PASS  a toolbox saved with a byte order mark still reads as clean
 --------------------------------------------------------------------
-106 assertions, 0 failed
+195 assertions, 0 failed
 ```
+
+The `...` above stands for the assertions not quoted here. Every line that is quoted is printed
+verbatim, in that order, by the command above.
 
 ## Requirements
 
-Python 3.9 or later. Standard library only: `ast`, `argparse`, `json`, `sys`, `pathlib`.
-Nothing to install.
+Python 3.9 or later. Standard library only: `ast`, `argparse`, `json`, `sys`, `pathlib`, and
+`contextlib`, `io`, `os` and `tempfile` for the self-test. Nothing to install.
 
 The toolbox is parsed, never imported, so `arcpy` is not needed and no ArcGIS software has to be
 present. The same command works in ArcGIS Pro's Python and in a plain `python3` on a build agent.
+
+`--self-test` needs no `arcpy`, no network and no toolbox of your own. It lints toolbox sources it
+carries inside it, and for the file handling it writes a handful of files into a temporary
+directory and removes them again. One of those files raises at module level: if anything ever
+imported a toolbox instead of parsing it, that assertion is the one that fails.
 
 ```
 git clone https://github.com/uhsear/pytlint.git
@@ -70,20 +92,20 @@ Output is one compiler-shaped line per finding, so an editor can jump to it.
 
 ```
 $ python pytlint.py ParcelTools.pyt
-ParcelTools.pyt:12: PYT007 warning: RebuildCentroids has no isLicensed. The tool then stays enabled whatever extension it needs, and fails at run time instead of greying out.
-ParcelTools.pyt:16: PYT017 warning: self.canRunInBackground is an ArcMap setting. Pro ignores it, so this line promises something it does not do.
-ParcelTools.pyt:27: PYT003 warning: Required parameter 'out_fc' follows the Optional one at line 23. The dialog lists optional parameters last, so the order the user sees is not this one.
+ParcelTools.pyt:11: PYT008 error: self.tools names Ghost, which is not defined in this file. Pro fails to load the whole toolbox, not just that one tool.
+ParcelTools.pyt:14: PYT007 warning: RebuildCentroids has no isLicensed. The tool then stays enabled whatever extension it needs, and fails at run time instead of greying out.
+ParcelTools.pyt:18: PYT017 warning: self.canRunInBackground is an ArcMap setting. Pro ignores it, so this line promises something it does not do.
+ParcelTools.pyt:27: PYT003 warning: Required parameter 'out_fc' follows the Optional one at line 24. The dialog lists optional parameters last, so the order the user sees is not this one.
 ParcelTools.pyt:27: PYT005 warning: parameter 'out_fc' is direction=Output but execute never assigns parameters[2]. Anything downstream in a model receives an empty result.
+ParcelTools.pyt:37: PYT001 error: RebuildCentroids.updateMessages reads parameters[3] but getParameterInfo returns 3 parameter(s), so the highest valid index is 2. Pro swallows the IndexError and the dialog will not open.
 ParcelTools.pyt:38: PYT001 error: RebuildCentroids.updateMessages reads parameters[3] but getParameterInfo returns 3 parameter(s), so the highest valid index is 2. Pro swallows the IndexError and the dialog will not open.
-ParcelTools.pyt:39: PYT001 error: RebuildCentroids.updateMessages reads parameters[3] but getParameterInfo returns 3 parameter(s), so the highest valid index is 2. Pro swallows the IndexError and the dialog will not open.
-ParcelTools.pyt:40: PYT004 warning: updateMessages assigns .value. Pro has already read the values by this point and discards the change. Set a value in updateParameters instead.
-ParcelTools.pyt:45: PYT006 error: execute reports an error at line 44 and then returns. The tool prints red text and still reports success, so the scheduled task wrapping it exits 0. Raise arcpy.ExecuteError instead.
-ParcelTools.pyt:49: PYT007 warning: ExportSales has no isLicensed. The tool then stays enabled whatever extension it needs, and fails at run time instead of greying out.
-ParcelTools.pyt:49: PYT009 error: ExportSales has no __init__. arcpy calls it on every tool.
-ParcelTools.pyt:49: PYT010 warning: ExportSales never assigns self.label, so the dialog shows the class name and the help pane is empty
-ParcelTools.pyt:49: PYT010 warning: ExportSales never assigns self.description, so the dialog shows the class name and the help pane is empty
-ParcelTools.pyt:54: PYT002 error: ExportSales declares the parameter name 'year' twice, first at line 51. Every lookup by that name reaches one of them and the other is unreachable.
-ParcelTools.pyt:54: PYT015 error: parameterType='Require' is not one of Required, Optional, Derived
+ParcelTools.pyt:39: PYT004 warning: updateMessages assigns .value. Pro has already read the values by this point and discards the change. Set a value in updateParameters instead.
+ParcelTools.pyt:44: PYT006 error: execute reports an error at line 43 and then returns. The tool prints red text and still reports success, so the scheduled task wrapping it exits 0. Raise arcpy.ExecuteError instead.
+ParcelTools.pyt:48: PYT009 error: ExportSales has no __init__. arcpy calls it on every tool.
+ParcelTools.pyt:48: PYT010 warning: ExportSales never assigns self.label, so the dialog shows the class name
+ParcelTools.pyt:48: PYT010 warning: ExportSales never assigns self.description, so the help pane is empty
+ParcelTools.pyt:52: PYT002 error: ExportSales declares the parameter name 'year' twice, first at line 50. Every lookup by that name reaches one of them and the other is unreachable.
+ParcelTools.pyt:52: PYT015 error: parameterType='Require' is not one of Required, Optional, Derived
 ParcelTools.pyt:59: PYT011 error: execute(self, parameters) does not match execute(self, parameters, messages), which is the signature arcpy calls
 ```
 
