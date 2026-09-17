@@ -98,6 +98,9 @@ RULES = (
     ("PYT016", "error", "updateParameters or updateMessages has the wrong signature"),
     ("PYT017", "warning", "self.canRunInBackground is set, and Pro ignores it"),
     ("PYT018", "warning", "the Toolbox class has no self.alias"),
+    ("PYT019", "error", "self.tools is built dynamically, so the toolbox opens empty"),
+    ("PYT020", "error", "execute catches everything and reports no traceback"),
+    ("PYT021", "warning", "sys.path is given one absolute path instead of a fallback"),
 )
 
 RULE_SEVERITY = dict((code, severity) for code, severity, _ in RULES)
@@ -194,6 +197,67 @@ def _self_assignments(cls):
                     target.value.id == "self" and target.attr not in found:
                 found[target.attr] = node
     return found
+
+
+def _nested_class_names(tree):
+    """Every class name defined somewhere other than the module level.
+
+    arcpy enumerates only static, module-level tool classes, so a class defined
+    inside a function or inside another class is not a tool however it is
+    listed in self.tools.
+    """
+    top = set(stmt.name for stmt in tree.body if isinstance(stmt, ast.ClassDef))
+    return set(node.name for node in ast.walk(tree)
+               if isinstance(node, ast.ClassDef)) - top
+
+
+def _absolute_literal(node):
+    r"""The text of a string literal holding an absolute path, else None.
+
+    os.path.isabs is not usable here. It answers for the platform the linter is
+    running on, and a .pyt written on Windows is linted in CI on Linux, where
+    r"C:\GIS\shared" is a relative path and the finding would disappear.
+    """
+    text = _string(node)
+    if not text:
+        return None
+    if text.startswith("/") or text.startswith("\\"):
+        return text
+    if len(text) > 2 and text[0].isalpha() and text[1] == ":" \
+            and text[2] in "/\\":
+        return text
+    return None
+
+
+def _catches_everything(handler):
+    """True for a bare except, and for one naming Exception or BaseException.
+
+    A narrow except is deliberate control flow. Only the broad one hides a
+    failure nobody chose to hide.
+    """
+    if handler.type is None:
+        return True
+    parts = handler.type.elts if isinstance(handler.type, ast.Tuple) \
+        else [handler.type]
+    return any(_dotted(part) in ("Exception", "BaseException")
+               for part in parts)
+
+
+# Names that put a traceback where a person can read it. logging.exception and
+# traceback.print_exc do it as surely as traceback.format_exc does.
+TRACEBACK_CALLS = ("format_exc", "print_exc", "format_exception", "exception")
+
+
+def _reports_failure(handler):
+    """True when the handler re-raises, or puts the traceback somewhere."""
+    for node in ast.walk(handler):
+        if isinstance(node, ast.Raise):
+            return True
+        if isinstance(node, ast.Name) and node.id in TRACEBACK_CALLS:
+            return True
+        if isinstance(node, ast.Attribute) and node.attr in TRACEBACK_CALLS:
+            return True
+    return False
 
 
 def _arg_names(fn):
@@ -602,6 +666,40 @@ def _check_tool_class(cls, out, is_toolbox=False):
                     "arcpy.ExecuteError instead." % error_line))
                 error_line = None
 
+    # ---- a broad except that leaves nothing to debug
+    # A tool that catches Exception and then neither re-raises nor prints the
+    # traceback gives Pro either a bare "Serious Application Error" or a
+    # successful run, and the person holding the failure has no line number to
+    # send anybody. Delegating to a shared wrapper is silent here on purpose:
+    # the handler is then in the wrapper, and this rule reads the handler.
+    for node in ast.walk(execute):
+        if not isinstance(node, ast.Try):
+            continue
+        for handler in node.handlers:
+            if not _catches_everything(handler) or _reports_failure(handler):
+                continue
+            out.append(Finding(
+                "PYT020", handler.lineno,
+                "execute catches every exception here and then neither "
+                "re-raises nor reports the traceback, so the failure reaches "
+                "nobody. Call traceback.format_exc() into the message and "
+                "raise arcpy.ExecuteError."))
+
+
+# The shapes that mean a tool list is decided while the toolbox loads. A
+# Starred element splats a list built elsewhere and belongs with the rest.
+DYNAMIC_TOOLS = (ast.Call, ast.ListComp, ast.GeneratorExp, ast.SetComp,
+                 ast.DictComp, ast.Starred)
+
+# The consequence is the same for every shape, and it is the quietest failure
+# in this whole file: the toolbox renders with no tools in it and nothing
+# anywhere says why. The toolbox this rule was written from carries a warning
+# left in it afterwards -- "do NOT reintroduce a dynamic tool factory here" --
+# because a factory had already emptied it once and cost a day to explain.
+EMPTY_TOOLBOX = ("%s. arcpy enumerates only static, module-level tool classes, "
+                 "so Pro opens this toolbox EMPTY, with no error, no message "
+                 "and no traceback.")
+
 
 def check_source(source):
     """Every finding for one toolbox source.
@@ -624,6 +722,27 @@ def check_source(source):
     for stmt in tree.body:
         if isinstance(stmt, ast.ClassDef):
             classes[stmt.name] = stmt
+    nested = _nested_class_names(tree)
+
+    # ---- sys.path pinned to one absolute path
+    # Anywhere in the file, because this runs at import time and a toolbox is
+    # free to do it inside a function.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        target = _dotted(node.func)
+        if target not in ("sys.path.insert", "sys.path.append"):
+            continue
+        argument = node.args[1:2] if target.endswith("insert") else node.args[:1]
+        literal = _absolute_literal(argument[0]) if argument else None
+        if literal is None:
+            continue
+        out.append(Finding(
+            "PYT021", node.lineno,
+            "sys.path is given the one absolute path %s, so the toolbox "
+            "imports its package only on a machine where that path exists. "
+            "Resolve the folder beside __file__ first and fall back to the "
+            "shared copy." % literal))
 
     toolbox = classes.get("Toolbox")
     tool_names = []
@@ -644,6 +763,12 @@ def check_source(source):
         elif isinstance(tools_assign.value, (ast.List, ast.Tuple)):
             for element in tools_assign.value.elts:
                 if isinstance(element, ast.Name):
+                    if element.id in nested:
+                        out.append(Finding("PYT019", element.lineno, EMPTY_TOOLBOX % (
+                            "self.tools names %s, which is defined inside "
+                            "another statement instead of at module level"
+                            % element.id)))
+                        continue
                     # A name listed twice is linted once. Pro loads the class
                     # once, and every finding reported twice is noise.
                     if element.id not in tool_names:
@@ -654,6 +779,19 @@ def check_source(source):
                             "self.tools names %s, which is not defined in this "
                             "file. Pro fails to load the whole toolbox, not "
                             "just that one tool." % element.id))
+                elif isinstance(element, DYNAMIC_TOOLS):
+                    out.append(Finding("PYT019", element.lineno, EMPTY_TOOLBOX %
+                                       "self.tools holds an entry built when "
+                                       "the toolbox loads rather than a class "
+                                       "name"))
+        else:
+            out.append(Finding("PYT019", tools_assign.lineno, EMPTY_TOOLBOX %
+                               "self.tools is built when the toolbox loads "
+                               "rather than written as a list of class names"))
+            # The tool names are undecidable now, so lint every other class,
+            # exactly as the missing-Toolbox branch above does. One finding
+            # must not hide the rest of the file behind it.
+            tool_names = [name for name in classes if name != "Toolbox"]
 
     for name in tool_names:
         cls = classes.get(name)
@@ -1548,7 +1686,7 @@ class Toolbox(object):
         self.label = "t"
         self.alias = "t"
         self.description = "t"
-        self.tools = discover_tools()
+        self.tools = discover_tools()  #@
 '''
     check(_silent(computed_tools, "PYT013"),
           "self.tools built by a call is an assignment and is not reported missing")
@@ -1558,6 +1696,163 @@ class Toolbox(object):
     string_tool = _pyt(GOOD_TOOL, tools='Demo, "Other"')
     check(_silent(string_tool, "PYT008"),
           "a string in self.tools is not a class name and is not reported")
+
+    # ---- the toolbox that loads, opens, and holds nothing
+    # Every shape below was silent until this rule existed, and the toolbox
+    # each one is modelled on opened in Pro with no tools in it, no error
+    # message and no traceback.
+    check(_fires(computed_tools, "PYT019"),
+          "self.tools built by a factory call fires on the assignment  <-- pinned defect")
+    check("EMPTY" in _message_for(computed_tools, "PYT019"),
+          "the message names the empty toolbox, which is the only symptom Pro gives")
+    check(_silent(CLEAN, "PYT019"),
+          "a plain list of module-level class names is silent")
+    check(_fires(computed_tools.replace("discover_tools()",
+                                        "[_make(c) for c in CHECKS]"), "PYT019"),
+          "a comprehension is the same finding as a factory call")
+    check(_lines_for(_pyt(GOOD_TOOL, tools="Demo, build_tool()"), "PYT019") == [9],
+          "one built entry beside a plain name still fires, on that entry")
+    check(_silent(_pyt(GOOD_TOOL, tools="Demo, build_tool()"), "PYT008"),
+          "a built entry is not a missing class name, so PYT008 stays out of it")
+    nested_tool = '''import arcpy
+
+
+class Toolbox(object):
+    def __init__(self):
+        self.label = "t"
+        self.alias = "t"
+        self.description = "t"
+        self.tools = [Hidden]  #@
+
+
+def register():
+    class Hidden(object):
+        pass
+'''
+    hidden_by_one = computed_tools.replace("discover_tools()", "build_all()") +         """
+
+class Demo(object):
+    def __init__(self):
+        self.label = "t"
+        self.description = "t"
+
+    def getParameterInfo(self):
+        return []
+
+    def execute(self, parameters, messages):
+        pass
+"""
+    check("PYT007" in [f.code for f in check_source(hidden_by_one)],
+          "one dynamic self.tools does not hide every finding in the rest of "
+          "the file behind it  <-- pinned defect")
+
+    check(_fires(nested_tool, "PYT019"),
+          "a class defined inside a function is not a tool, however it is listed")
+    check(_silent(nested_tool, "PYT008"),
+          "and it is not reported absent from the file, because it is in the file")
+
+    # ---- an execute that catches everything and leaves nothing to debug
+    swallowed = _pyt('''class Demo(object):
+    def __init__(self):
+        self.label = "Demo tool"
+        self.description = "Does one thing"
+
+    def isLicensed(self):
+        return True
+
+    def getParameterInfo(self):
+        return []
+
+    def execute(self, parameters, messages):
+        try:
+            run_the_work(parameters)
+        except Exception:  #@
+            messages.addErrorMessage("the tool failed")
+''')
+    check(_fires(swallowed, "PYT020"),
+          "a broad except that reports no traceback fires on the handler")
+    check("traceback" in _message_for(swallowed, "PYT020"),
+          "the message names the traceback, which is the thing that is missing")
+    check(_fires(swallowed.replace("except Exception:  #@", "except:  #@"), "PYT020"),
+          "a bare except is the same finding")
+    check(_fires(swallowed.replace("except Exception:  #@",
+                                   "except (ValueError, Exception):  #@"), "PYT020"),
+          "Exception inside a tuple of caught types is still the broad catch")
+    check(_silent(swallowed.replace("except Exception:  #@", "except KeyError:  #@"),
+                  "PYT020"),
+          "a narrow except is deliberate control flow and is not reported")
+    check(_silent(swallowed.replace('messages.addErrorMessage("the tool failed")',
+                                    "messages.addErrorMessage(traceback.format_exc())"),
+                  "PYT020"),
+          "the same handler is silent once it reports the traceback")
+    check(_silent(swallowed.replace('messages.addErrorMessage("the tool failed")',
+                                    'logging.exception("the tool failed")'), "PYT020"),
+          "logging.exception writes the traceback too, so it is silent")
+    check(_silent(swallowed.replace('messages.addErrorMessage("the tool failed")',
+                                    "messages.addErrorMessage(format_exc())"), "PYT020"),
+          "format_exc imported by name reports the traceback just as well")
+    check(_silent(swallowed.replace('messages.addErrorMessage("the tool failed")',
+                                    'raise arcpy.ExecuteError("failed")'), "PYT020"),
+          "a handler that re-raises is silent, because Pro is then told")
+    # The shape the rule must not fire on: the handler lives in one shared
+    # wrapper and every execute hands the work to it. That is the fix, not the
+    # defect, and a rule that reported it would be turned off within a day.
+    delegated = swallowed.replace('''        try:
+            run_the_work(parameters)
+        except Exception:  #@
+            messages.addErrorMessage("the tool failed")
+''', '''        return _guard(lambda: run_the_work(parameters), messages)  #@
+''')
+    check(_silent(delegated, "PYT020"),
+          "an execute that hands the work to a shared wrapper holds no handler")
+    check(_silent(CLEAN, "PYT020"),
+          "an execute with no try at all is not reported")
+
+    # ---- sys.path pinned to one absolute path
+    pinned_path = r'''import os
+import sys
+
+sys.path.insert(0, r"C:\GIS\shared")  #@
+''' + CLEAN
+    check(_fires(pinned_path, "PYT021"),
+          "one absolute path inserted into sys.path fires on that line")
+    check("C:" in _message_for(pinned_path, "PYT021"),
+          "the message quotes the path, and quotes it on Linux too, where "
+          "os.path.isabs would call it relative  <-- pinned defect")
+    check("\\\\" not in _message_for(pinned_path, "PYT021"),
+          "the path in the message is the path, not a repr of it with every "
+          "backslash doubled  <-- pinned defect")
+    check(_fires(pinned_path.replace(r'sys.path.insert(0, r"C:\GIS\shared")',
+                                     r'sys.path.append(r"\\fileserver\gis\shared")'),
+                 "PYT021"),
+          "append is the same finding as insert, and a UNC path is absolute")
+    check(_fires(pinned_path.replace(r'sys.path.insert(0, r"C:\GIS\shared")',
+                                     'sys.path.insert(0, "/opt/gis/shared")'), "PYT021"),
+          "a POSIX absolute path fires on Windows too")
+    check(_silent(pinned_path.replace(r'sys.path.insert(0, r"C:\GIS\shared")',
+                                      'sys.path.insert(0, "checks")'), "PYT021"),
+          "a relative path is portable and is not reported")
+    check(_silent(pinned_path.replace(r'sys.path.insert(0, r"C:\GIS\shared")',
+                                      "sys.path.insert()"), "PYT021"),
+          "a call with no path argument is not a finding and does not raise")
+    check(_silent(pinned_path.replace(r'sys.path.insert(0, r"C:\GIS\shared")',
+                                      r'other.setdefault(0, r"C:\GIS")'), "PYT021"),
+          "an absolute path given to something other than sys.path is not this rule")
+    # The form this rule exists to point at: the folder beside the toolbox
+    # wins, the shared copy is the fallback, and neither path is written down.
+    local_first = r'''import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+PKG_ROOT = next((p for p in (_HERE, os.path.join(os.path.dirname(_HERE), "_shared"))
+                 if os.path.isdir(os.path.join(p, "checks"))), _HERE)
+if PKG_ROOT not in sys.path:
+    sys.path.insert(0, PKG_ROOT)  #@
+''' + CLEAN
+    check(_silent(local_first, "PYT021"),
+          "the local-first-then-shared form is the fix, and stays silent")
+    check(check_source(local_first) == [],
+          "and that whole toolbox is still clean, not clean apart from one rule")
 
     # ---- the renderers
     finding = check_source(bad_index)[0]

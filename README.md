@@ -20,6 +20,16 @@ The second flavour is worse, because it succeeds. `execute` calls `arcpy.AddErro
 returns instead of raising. The tool prints red text, reports "Completed successfully", and the
 scheduled task wrapping it exits 0 forever. Nobody looks at a job that keeps passing.
 
+The third is the quietest of all. `arcpy` enumerates only static, module-level tool classes,
+so a `self.tools` built by a comprehension or a factory call makes the toolbox open **empty** in
+Pro. No error, no message, no traceback, and every tool in the file is gone.
+
+```python
+class Toolbox(object):
+    def __init__(self):
+        self.tools = [_make(check) for check in CHECKS]   # the toolbox opens empty
+```
+
 ```
 $ python pytlint.py --self-test
 pytlint self-test: no arcpy, no toolbox file, no network
@@ -46,6 +56,12 @@ PASS  a positional-only execute is the signature arcpy calls and is silent  <-- 
 ...
 PASS  a list grown with += is not counted either  <-- pinned defect
 ...
+PASS  self.tools built by a factory call fires on the assignment  <-- pinned defect
+PASS  one dynamic self.tools does not hide every finding in the rest of the file behind it  <-- pinned defect
+PASS  a broad except that reports no traceback fires on the handler
+PASS  an execute that hands the work to a shared wrapper holds no handler
+PASS  the path in the message is the path, not a repr of it with every backslash doubled  <-- pinned defect
+...
 PASS  a path that is not there exits 2
 PASS  a directory instead of a file exits 2
 PASS  a file that is not text at all exits 2
@@ -56,7 +72,7 @@ PASS  every JSON finding carries the five documented keys
 ...
 PASS  a toolbox saved with a byte order mark still reads as clean
 --------------------------------------------------------------------
-195 assertions, 0 failed
+225 assertions, 0 failed
 ```
 
 The `...` above stands for the assertions not quoted here. Every line that is quoted is printed
@@ -153,6 +169,9 @@ This tool only reads. It never edits a toolbox, so there is nothing here to guar
 | `PYT016` | error | `updateParameters` or `updateMessages` does not match `(self, parameters)`. |
 | `PYT017` | warning | `self.canRunInBackground` is set, and Pro ignores it. |
 | `PYT018` | warning | The `Toolbox` class has no `self.alias`. |
+| `PYT019` | error | `self.tools` is built while the toolbox loads, so Pro opens it empty. |
+| `PYT020` | error | `execute` catches every exception and neither re-raises nor reports the traceback. |
+| `PYT021` | warning | `sys.path` is given one absolute path instead of a local-first fallback. |
 
 A rule is an error only when the finding is certain breakage. Everything else is a warning and
 does not change the exit code, unless you pass `--strict`.
@@ -201,6 +220,15 @@ Pro, a licence, and a person.
   reports it as undefined.
 - `PYT005` looks for an assignment to `parameters[i]` or a call to `SetParameter`. A tool that
   writes its output through a helper function is reported even though it is correct.
+- `PYT019` reads the shape of `self.tools`, not what the shape evaluates to. A list of plain
+  module-level class names is accepted, and everything else is reported, so a factory that
+  happens to return static classes is a false report. Pro accepts only the plain list, which is
+  why the rule is written the way Pro reads the file.
+- `PYT020` reads the handlers inside `execute` only. A broad `except` in a helper that `execute`
+  calls is the same defect and is not reported, and an `execute` that hands its work to a shared
+  wrapper is silent because the handler is then in the wrapper.
+- `PYT021` reads literal paths only. `sys.path.insert(0, os.path.join(ROOT, "shared"))` is
+  skipped, because the value of `ROOT` is not decidable from the source.
 - No datatype checking. A `datatype` string that Pro does not recognise is not caught.
 - A clean run is not a working toolbox. This finds structural mistakes, not wrong geoprocessing.
 
