@@ -31,6 +31,13 @@ with no Esri software on it.
     python pytlint.py MyTools.pyt
     python pytlint.py toolboxes/*.pyt --json
     python pytlint.py MyTools.pyt --select PYT001,PYT006
+    python pytlint.py --script nightly_job.py
+
+--script widens the subject from a .pyt to a plain .py entry point, because the
+disaster above is not about the extension. A scheduled script whose main()
+catches Exception, writes the traceback to a log and returns exits 0 too, and
+Task Scheduler has reported it healthy every night since it broke. That mode
+drops every Toolbox rule and keeps the four that apply to a script.
 
 Exit codes: 0 clean, 1 an error-severity finding, 2 a file could not be read,
 64 usage error.
@@ -101,7 +108,16 @@ RULES = (
     ("PYT019", "error", "self.tools is built dynamically, so the toolbox opens empty"),
     ("PYT020", "error", "execute catches everything and reports no traceback"),
     ("PYT021", "warning", "sys.path is given one absolute path instead of a fallback"),
+    ("PYT022", "error", "a string escape ate the backslash out of a path literal"),
+    ("PYT023", "error", "a script entry point catches everything and still exits 0"),
 )
+
+# The codes that mean anything in a plain .py under --script. Everything else
+# in RULES is about a Toolbox class, so on a script every one of them is a
+# false positive -- PYT012 alone is why "pytlint some_script.py" was useless.
+# This is a keep list rather than a drop list on purpose: a rule added later
+# is about a toolbox until somebody decides otherwise, and stays out of here.
+SCRIPT_CODES = ("PYT000", "PYT021", "PYT022", "PYT023")
 
 RULE_SEVERITY = dict((code, severity) for code, severity, _ in RULES)
 ALL_CODES = tuple(code for code, _, _ in RULES)
@@ -226,6 +242,61 @@ def _absolute_literal(node):
     if len(text) > 2 and text[0].isalpha() and text[1] == ":" \
             and text[2] in "/\\":
         return text
+    return None
+
+
+def _mangled_path(text):
+    """The control character a string escape left in a path literal, else None.
+
+    Read from the value ast already decoded, never from the source text. That
+    is the whole trick: "C:\082719.gdb" is C:, a NUL byte, then 82719.gdb,
+    because \0 is a valid octal escape and Python ate the separator. Letting
+    the parser do the decoding also settles the case that catches every
+    hand-written scanner -- \0, \07 and \007 are one escape each, not two.
+
+    Path-shaped means a drive-letter prefix or a surviving backslash. An
+    extension list was tried and dropped: it fired on docstrings that mention
+    a .gdb and happen to hold a newline.
+    """
+    drive = len(text) > 1 and text[0].isalpha() and text[1] == ":"
+    if not (drive or "\\" in text):
+        return None
+    for char in text:
+        if ord(char) < 32:
+            return char
+    return None
+
+
+# Names that end the process with a status the caller can see. sys.exit(0) is
+# absent on purpose: it exits, but it exits clean, so it is the same lie as
+# falling off the end of the handler.
+EXIT_CALLS = ("sys.exit", "exit", "os._exit", "os.abort")
+
+
+def _exits_nonzero(node):
+    """True when this subtree can end the process with a non-zero status."""
+    for child in ast.walk(node):
+        if isinstance(child, ast.Raise):
+            return True
+        if not isinstance(child, ast.Call):
+            continue
+        if _dotted(child.func) not in EXIT_CALLS:
+            continue
+        status = child.args[0] if child.args else None
+        if isinstance(status, ast.Constant) and status.value in (0, None):
+            continue
+        return True
+    return False
+
+
+def _main_guard(tree):
+    """The line of a module-level `if __name__ == "__main__":`, else None."""
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.If):
+            continue
+        for child in ast.walk(stmt.test):
+            if isinstance(child, ast.Name) and child.id == "__name__":
+                return stmt.lineno
     return None
 
 
@@ -701,11 +772,15 @@ EMPTY_TOOLBOX = ("%s. arcpy enumerates only static, module-level tool classes, "
                  "and no traceback.")
 
 
-def check_source(source):
-    """Every finding for one toolbox source.
+def check_source(source, script=False):
+    """Every finding for one toolbox source, or for one plain .py under script.
 
-    Pure: no file, no arcpy, no network, and the toolbox is never imported, so
+    Pure: no file, no arcpy, no network, and the file is never imported, so
     nothing in it executes.
+
+    script widens the subject from a .pyt to a scheduled .py entry point. It
+    does not add rules -- PYT022 and PYT023 run either way -- it drops the
+    toolbox rules, which every script in the world fails.
     """
     # Windows editors save a .pyt with a UTF-8 byte order mark, and Python
     # strips that mark when it imports the file. ast.parse does not strip it
@@ -743,6 +818,44 @@ def check_source(source):
             "imports its package only on a machine where that path exists. "
             "Resolve the folder beside __file__ first and fall back to the "
             "shared copy." % literal))
+
+    # ---- a path literal whose backslash the parser ate
+    # Every string in the file, because a path reaches arcpy from a constant,
+    # a default argument or a dict just as often as from an assignment.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        char = _mangled_path(node.value)
+        if char is None:
+            continue
+        out.append(Finding(
+            "PYT022", node.lineno,
+            "a string escape turned a path separator into chr(%d), so this "
+            "literal is not the path it looks like. Write it as a raw string "
+            "or double the backslash. ruff, pyflakes and pycodestyle are all "
+            "silent here, because the escape is valid." % ord(char)))
+
+    # ---- an entry point that cannot report failure to whatever scheduled it
+    # Whole-file on purpose, and deliberately conservative. One raise or one
+    # non-zero exit anywhere in the file clears it, because that one can
+    # propagate. Checking handlers one at a time reported the inner handler of
+    # a retry block -- the outer handler re-raised two lines later, and the
+    # process did exit non-zero.
+    guard = _main_guard(tree)
+    if guard is not None and not _exits_nonzero(tree):
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ExceptHandler):
+                continue
+            if not _catches_everything(node):
+                continue
+            out.append(Finding(
+                "PYT023", node.lineno,
+                "this handler catches every exception, and nothing anywhere in "
+                "the file raises or exits non-zero, so the process ends 0 "
+                "whatever happened. Task Scheduler reports the job healthy "
+                "forever. Writing the traceback to a log does not fix it: the "
+                "log is not the exit code. Re-raise, or sys.exit(1)."))
+            break
 
     toolbox = classes.get("Toolbox")
     tool_names = []
@@ -797,6 +910,9 @@ def check_source(source):
         cls = classes.get(name)
         if cls is not None:
             _check_tool_class(cls, out)
+
+    if script:
+        out = [finding for finding in out if finding.code in SCRIPT_CODES]
 
     out.sort(key=lambda finding: finding.sort_key)
     return out
@@ -1854,6 +1970,153 @@ if PKG_ROOT not in sys.path:
     check(check_source(local_first) == [],
           "and that whole toolbox is still clean, not clean apart from one rule")
 
+    # ---- a path literal whose backslash the parser ate
+    # The defect is invisible in the source line: "C:\082719.gdb" reads as a
+    # path and is C:, a NUL byte, then 82719.gdb. Reproduced before the rule
+    # was written -- len() is 12, not 13, and ruff --select ALL --isolated
+    # reports only D100 and CPY001 on the same file.
+    mangled = r"""import arcpy
+
+GDB = "C:\082719.gdb"  #@
+""" + CLEAN
+    check(_fires(mangled, "PYT022"),
+          "a path literal holding a valid escape fires on that line")
+    check("chr(0)" in _message_for(mangled, "PYT022"),
+          "the message names the character the escape left behind, so the "
+          "reader can see why a path that looks right does not open")
+    check(_silent(mangled.replace(r'"C:\082719.gdb"', r'r"C:\082719.gdb"'),
+                  "PYT022"),
+          "the raw string spelling of the same path is the fix, and is silent")
+    check(_silent(mangled.replace(r'"C:\082719.gdb"', r'"C:\\082719.gdb"'),
+                  "PYT022"),
+          "the doubled backslash spelling is the other fix, and is silent")
+    # The load-bearing case, and the reason this rule reads the value ast
+    # decoded instead of scanning the source for backslashes. A hand-written
+    # scanner reads \0 and stops, and reports chr(0) followed by a literal 7.
+    # Python reads \07 as one escape, and the character is chr(7).
+    octal = mangled.replace(r'"C:\082719.gdb"', r'"C:\07Streets.shp"')
+    check(_fires(octal, "PYT022"),
+          "a three character octal escape fires as well as a one character one")
+    check("chr(7)" in _message_for(octal, "PYT022"),
+          "an octal escape is read whole, so the character is chr(7), not "
+          "chr(0) followed by a 7  <-- pinned defect")
+    check(_fires(mangled.replace(r'"C:\082719.gdb"',
+                                 r'"\\fileserver\gis\007_streets"'), "PYT022"),
+          "a UNC path loses its separator the same way and fires the same rule")
+    check(_silent(mangled.replace(r'"C:\082719.gdb"', r'"col1\tcol2"'), "PYT022"),
+          "a tab separated header is not path shaped, so the tab is not a "
+          "consumed separator and nothing is reported")
+    check(_silent(mangled.replace(r'"C:\082719.gdb"', r'"loaded\n"'), "PYT022"),
+          "a newline in a message string is not this rule")
+    check(_silent(mangled.replace(r'"C:\082719.gdb"',
+                                  r'"""Copy a .gdb\nsomewhere else."""'),
+                  "PYT022"),
+          "a docstring that mentions a geodatabase and holds a newline stays "
+          "silent, which an extension list in the shape test did not  "
+          "<-- pinned defect")
+    check(_silent(CLEAN, "PYT022"),
+          "a toolbox with no path literal in it is not reported")
+
+    # ---- an entry point that cannot report failure
+    # The disaster pytlint is named for, on the other extension. Reproduced by
+    # execution before the rule was written: the script below raises, logging
+    # writes the whole traceback to the console, and the process exits 0.
+    nightly = """import logging
+
+
+def main():
+    try:
+        rebuild_indexes()
+    except Exception as exc:  #@
+        logging.error("maintenance failed: %s", exc, exc_info=True)
+
+
+if __name__ == "__main__":
+    main()
+"""
+    check(_fires(nightly, "PYT023"),
+          "a handler that logs the failure with a full traceback and returns "
+          "still fires, because the log is not the exit code  <-- pinned defect")
+    check("exit" in _message_for(nightly, "PYT023"),
+          "the message is about the exit code, not about the logging")
+    # The wrong fix a maintainer reaches for is to decide this rule the way
+    # PYT020 decides its own: by asking whether the traceback was reported.
+    # PYT020 asks whether the person holding the failure has a line number.
+    # This rule asks whether the scheduler was told. A handler can answer yes
+    # to the first and no to the second, and the file that started this rule
+    # is exactly that file, so TRACEBACK_CALLS is deliberately not consulted.
+    check(_fires(nightly.replace(
+        'logging.error("maintenance failed: %s", exc, exc_info=True)',
+        "traceback.print_exc()"), "PYT023"),
+          "a handler that prints the whole traceback still fires, so widening "
+          "TRACEBACK_CALLS cannot silence this rule  <-- pinned defect")
+    check(_silent(nightly.replace(
+        'logging.error("maintenance failed: %s", exc, exc_info=True)',
+        'logging.exception("failed")\n        raise'), "PYT023"),
+          "a handler that re-raises is silent, because the process then ends "
+          "non-zero and the scheduler sees it")
+    check(_silent(nightly.replace(
+        'logging.error("maintenance failed: %s", exc, exc_info=True)',
+        'logging.error("failed")\n        sys.exit(1)'), "PYT023"),
+          "sys.exit(1) is the other way to tell the scheduler, and is silent")
+    check(_fires(nightly.replace(
+        'logging.error("maintenance failed: %s", exc, exc_info=True)',
+        'logging.error("failed")\n        sys.exit(0)'), "PYT023"),
+          "sys.exit(0) exits, and exits clean, so it is the same lie and fires")
+    check(_silent(nightly.replace("    except Exception as exc:  #@",
+                                  "    except ValueError as exc:  #@"), "PYT023"),
+          "a narrow except is deliberate control flow and is not this rule")
+    check(_silent(nightly.replace(
+        '\nif __name__ == "__main__":\n    main()\n', ""), "PYT023"),
+          "a module with no __main__ guard is imported by something else, so "
+          "its exit code is not its own and it is not an entry point")
+    # The shape that made a per-handler version of this rule unusable. The
+    # inner handler is quiet, and two lines later the outer one re-raises, so
+    # the process does exit non-zero and nothing here is wrong.
+    retry = """import logging
+
+
+def main():
+    try:
+        rebuild_indexes()
+    except Exception:
+        try:
+            restart_service()
+        except Exception:  #@
+            logging.error("could not restart")
+        raise
+
+
+if __name__ == "__main__":
+    main()
+"""
+    check(_silent(retry, "PYT023"),
+          "a quiet inner handler inside a retry block whose outer handler "
+          "re-raises is silent  <-- pinned defect")
+    check(len([f for f in check_source(nightly) if f.code == "PYT023"]) == 1,
+          "the verdict is about the file, so a file gets one finding and not "
+          "one per handler")
+    check(_silent(CLEAN, "PYT023"),
+          "a toolbox has no __main__ guard, so this rule never fires on one")
+    check(RULE_SEVERITY["PYT023"] == "error" and RULE_SEVERITY["PYT022"] == "error",
+          "both new rules are errors, because both are certain breakage")
+
+    # ---- script mode
+    check(set(SCRIPT_CODES) <= set(ALL_CODES),
+          "every code kept under --script is a rule this tool implements")
+    check("PYT012" in [f.code for f in check_source(nightly)],
+          "a plain .py has no Toolbox class, so the default mode reports "
+          "PYT012 on it -- that finding is the barrier --script removes")
+    script_findings = [f.code for f in check_source(nightly, script=True)]
+    check("PYT023" in script_findings and "PYT012" not in script_findings,
+          "--script keeps the entry point finding and drops the toolbox one")
+    check(check_source(CLEAN, script=True) == [],
+          "a toolbox read as a script reports nothing, rather than reporting "
+          "its toolbox rules under a mode that does not mean them")
+    check([f.code for f in check_source(mangled, script=True)] == ["PYT022"],
+          "PYT022 is neither a script rule nor a toolbox rule, so it survives "
+          "both modes")
+
     # ---- the renderers
     finding = check_source(bad_index)[0]
     check(finding.as_dict()["code"] == finding.code
@@ -2155,6 +2418,10 @@ def _parse(argv):
                "nothing here to guard behind --apply.",
     )
     ap.add_argument("paths", nargs="*", help=".pyt files to check")
+    ap.add_argument("--script", action="store_true",
+                    help="the paths are plain .py entry points, not toolboxes. "
+                         "Drops every Toolbox rule and keeps PYT000, PYT021, "
+                         "PYT022 and PYT023.")
     ap.add_argument("--json", action="store_true",
                     help="machine readable output on stdout")
     ap.add_argument("--select",
@@ -2207,7 +2474,8 @@ def main(argv=None):
             status = max(status, 2)
             continue
 
-        findings = filter_findings(check_source(source), select, ignore)
+        findings = filter_findings(check_source(source, args.script),
+                                   select, ignore)
         collected.append((path, findings))
         status = max(status, exit_code(findings, args.strict))
 
