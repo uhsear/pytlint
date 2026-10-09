@@ -62,6 +62,8 @@ PASS  a broad except that reports no traceback fires on the handler
 PASS  an execute that hands the work to a shared wrapper holds no handler
 PASS  the path in the message is the path, not a repr of it with every backslash doubled  <-- pinned defect
 ...
+PASS  a unique prefix of --list-rules is refused by the parser  <-- pinned defect
+...
 PASS  a path that is not there exits 2
 PASS  a directory instead of a file exits 2
 PASS  a file that is not text at all exits 2
@@ -72,7 +74,7 @@ PASS  every JSON finding carries the five documented keys
 ...
 PASS  a toolbox saved with a byte order mark still reads as clean
 --------------------------------------------------------------------
-225 assertions, 0 failed
+254 assertions, 0 failed
 ```
 
 The `...` above stands for the assertions not quoted here. Every line that is quoted is printed

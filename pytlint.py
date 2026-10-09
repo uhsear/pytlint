@@ -2242,6 +2242,16 @@ class Toolbox(object):
           "more than one path is read")
     check(_parse([]).paths == [], "no path at all parses, and main turns it into a usage error")
 
+    # argparse accepts a unique prefix of a long option unless allow_abbrev is off.
+    # --list-rules is the longest option, so its prefix "--list-r" is the probe.
+    refused = False
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            _parse(["--list-r"])
+    except SystemExit as exc:
+        refused = exc.code == 2
+    check(refused, "a unique prefix of --list-rules is refused by the parser  <-- pinned defect")
+
     # ---- end to end through main(), against files on disk
     # main() is the only part of this tool that opens a file, so it is the only
     # part the assertions above cannot reach. Nothing below needs arcpy, a
@@ -2416,6 +2426,7 @@ def _parse(argv):
                     "file with ast and never imports it.",
         epilog="This tool only reads. It never edits a toolbox, so there is "
                "nothing here to guard behind --apply.",
+        allow_abbrev=False,
     )
     ap.add_argument("paths", nargs="*", help=".pyt files to check")
     ap.add_argument("--script", action="store_true",
