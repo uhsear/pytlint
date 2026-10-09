@@ -1,7 +1,8 @@
 # pytlint
 
 Static analysis for ArcGIS Python toolboxes. Names the parameter index that will grey out the
-dialog and the AddError that reports success. Never imports the file it checks.
+dialog and the broad `except` that throws the cause of a failure away. Never imports the file it
+checks.
 
 A `.pyt` works on your machine. A colleague opens it in Pro, the dialog will not open, and there
 is no traceback and no message. The cause is two methods that disagree about how many parameters
@@ -16,9 +17,10 @@ def updateMessages(self, parameters):
         parameters[3].setErrorMessage("pick a workspace")
 ```
 
-The second flavour is worse, because it succeeds. `execute` calls `arcpy.AddError(...)` and then
-returns instead of raising. The tool prints red text, reports "Completed successfully", and the
-scheduled task wrapping it exits 0 forever. Nobody looks at a job that keeps passing.
+The second flavour fails and does not say why. `execute` wraps the work in a bare `except`, calls
+`arcpy.AddError("the update failed")` and returns. Pro marks the tool as failed, but the
+exception that caused the failure is gone: its type, its text and its line number. The person
+who holds the failure has nothing to send to anybody, and the next run fails the same way.
 
 The third is the quietest of all. `arcpy` enumerates only static, module-level tool classes,
 so a `self.tools` built by a comprehension or a factory call makes the toolbox open **empty** in
@@ -62,6 +64,22 @@ PASS  a broad except that reports no traceback fires on the handler
 PASS  an execute that hands the work to a shared wrapper holds no handler
 PASS  the path in the message is the path, not a repr of it with every backslash doubled  <-- pinned defect
 ...
+PASS  a parser that defines --apply without allow_abbrev=False fires on the parser line
+PASS  that parser, run for real, reads --ap, --app and --appl as --apply
+PASS  the same parser with allow_abbrev=False is silent
+PASS  the guarded parser, run for real, refuses --ap and still takes --apply
+...
+PASS  a subparser that defines --apply fires, even under a guarded parent  <-- pinned defect
+PASS  and run for real, the guarded parent does not stop run --ap from reaching --apply
+PASS  allow_abbrev=False on add_parser itself is the fix, run for real
+...
+PASS  a parser built from an ArgumentParser subclass fires, and run for real it reads --ap as --apply  <-- pinned defect
+...
+PASS  an optional finding is dropped unless --select names it, and --ignore still wins
+PASS  an invalid escape in the toolbox raises no compiler warning on stderr and is not a finding  <-- pinned defect
+...
+PASS  a failing assertion is counted as failed, and the footer says so
+...
 PASS  a unique prefix of --list-rules is refused by the parser  <-- pinned defect
 ...
 PASS  a path that is not there exits 2
@@ -74,16 +92,17 @@ PASS  every JSON finding carries the five documented keys
 ...
 PASS  a toolbox saved with a byte order mark still reads as clean
 --------------------------------------------------------------------
-254 assertions, 0 failed
+290 assertions, 0 failed
 ```
 
 The `...` above stands for the assertions not quoted here. Every line that is quoted is printed
-verbatim, in that order, by the command above.
+verbatim, in that order, by the command above. The count is 290 on Windows with Python 3.13.2
+and on Linux with Python 3.12.3, and the two outputs are identical line for line.
 
 ## Requirements
 
-Python 3.9 or later. Standard library only: `ast`, `argparse`, `json`, `sys`, `pathlib`, and
-`contextlib`, `io`, `os` and `tempfile` for the self-test. Nothing to install.
+Python 3.9 or later. Standard library only: `ast`, `argparse`, `json`, `sys`, `pathlib`,
+`warnings`, and `contextlib`, `io`, `os` and `tempfile` for the self-test. Nothing to install.
 
 The toolbox is parsed, never imported, so `arcpy` is not needed and no ArcGIS software has to be
 present. The same command works in ArcGIS Pro's Python and in a plain `python3` on a build agent.
@@ -92,6 +111,11 @@ present. The same command works in ArcGIS Pro's Python and in a plain `python3` 
 carries inside it, and for the file handling it writes a handful of files into a temporary
 directory and removes them again. One of those files raises at module level: if anything ever
 imported a toolbox instead of parsing it, that assertion is the one that fails.
+
+The `PYT024` assertions are the one place where the self-test runs code. Each of its small
+argparse fixtures is executed once, through the `argparse` of the interpreter that runs the
+self-test, so the rule's verdict and the parser's real behaviour are checked side by side. Those
+fixtures are the self-test's own source text, never a file you pass in.
 
 ```
 git clone https://github.com/uhsear/pytlint.git
@@ -102,6 +126,7 @@ git clone https://github.com/uhsear/pytlint.git
 ```
 python pytlint.py --self-test
 python pytlint.py MyTools.pyt
+python pytlint.py --script --select PYT024 my_tool.py
 ```
 
 ## Usage
@@ -130,8 +155,9 @@ ParcelTools.pyt:59: PYT011 error: execute(self, parameters) does not match execu
 | Flag | Default | What it does |
 |---|---|---|
 | `paths` | none | One or more `.pyt` files. Required unless `--self-test` or `--list-rules`. |
+| `--script` | off | The paths are plain `.py` entry points. Drops every Toolbox rule and keeps `PYT000`, `PYT021`, `PYT022`, `PYT023` and the optional `PYT024`. |
 | `--json` | off | Machine readable output on stdout. |
-| `--select` | none | Comma separated codes to report, to the exclusion of every other code. |
+| `--select` | none | Comma separated codes to report, to the exclusion of every other code. The only way to turn on an optional rule. |
 | `--ignore` | none | Comma separated codes to drop. Applied after `--select`. |
 | `--strict` | off | Exit 1 on a warning as well as on an error. |
 | `--list-rules` | off | Print every rule code and exit. |
@@ -146,7 +172,8 @@ python pytlint.py toolboxes/*.pyt --ignore PYT007,PYT017 --json
 ```
 
 This tool only reads. It never edits a toolbox, so there is nothing here to guard behind
-`--apply`.
+`--apply`. Its parser still sets `allow_abbrev=False`, and the self-test pins that `--list-r` is
+refused rather than read as `--list-rules`.
 
 ## What it checks
 
@@ -174,9 +201,57 @@ This tool only reads. It never edits a toolbox, so there is nothing here to guar
 | `PYT019` | error | `self.tools` is built while the toolbox loads, so Pro opens it empty. |
 | `PYT020` | error | `execute` catches every exception and neither re-raises nor reports the traceback. |
 | `PYT021` | warning | `sys.path` is given one absolute path instead of a local-first fallback. |
+| `PYT022` | error | A string escape removed the backslash from a path literal, as in `"C:\082719.gdb"`. |
+| `PYT023` | error | A script entry point catches every exception and still exits 0. |
+| `PYT024` | warning | Optional. A parser defines `--apply` and does not set `allow_abbrev=False`. |
 
 A rule is an error only when the finding is certain breakage. Everything else is a warning and
 does not change the exit code, unless you pass `--strict`.
+
+An optional rule is reported only when `--select` names it. `check_source()` still returns its
+findings, and the filter removes them, so the default output is the same as before the rule
+existed.
+
+## The optional rule: PYT024, a typed prefix that writes
+
+A colleague runs a cleanup tool to see what it would delete. The tool is a dry run unless it gets
+`--apply`. They type `--ap`, meaning to type something else, and press Enter. argparse reads
+`--ap` as `--apply`, because by default it accepts any unique prefix of a long option. The dry
+run they wanted is now a write.
+
+The Python documentation says it plainly. `allow_abbrev` "Allows long options to be abbreviated
+if the abbreviation is unambiguous (default: `True`)", and setting it to `False` makes the parser
+refuse the prefix with "unrecognized arguments"
+([argparse, allow_abbrev](https://docs.python.org/3/library/argparse.html#allow-abbrev)).
+`PYT024` reports a parser that defines `--apply` and does not pass `allow_abbrev=False`.
+
+```
+$ python pytlint.py --script --select PYT024 writer.py
+writer.py:5: PYT024 warning: this parser defines --apply at line 6 and does not pass allow_abbrev=False to ArgumentParser(), so argparse reads a unique prefix such as --ap or --app as --apply, and a typed prefix makes the write. A subparser needs its own allow_abbrev=False; the parent's does not reach it.
+```
+
+Use `--select PYT024 --strict` to fail a build on it. The rule follows three shapes that are easy
+to get wrong:
+
+- A subparser. `add_parser()` "takes a command name and any `ArgumentParser` constructor
+  arguments, and returns an `ArgumentParser` object"
+  ([argparse, sub-commands](https://docs.python.org/3/library/argparse.html#sub-commands)). It
+  has its own `allow_abbrev`. The self-test shows that `run --ap` still reaches `--apply` when
+  only the parent parser has the guard.
+- An argument group or a mutually exclusive group. A group is not a parser, so its options
+  follow the guard of the parser that made the group.
+- A subclass of `ArgumentParser`, for example one that only changes `error()`. The first
+  version of this rule knew only the name `ArgumentParser` and did not report such a parser.
+  A subclass that defines its own `__init__` can set the guard there, so that call site is not
+  reported.
+
+Every one of these verdicts is paired in the self-test with a real `parse_args()` call on the
+same fixture, on both hosts.
+
+The rule checks the fix. On 2026-10-09, 41 Python files in this portfolio defined `--apply`, and
+`--script --select PYT024` reported nothing on them. The versions of `svcguard.py`, `fcload.py`
+and `hostedreap.py` from just before each one got its guard were each reported once, and the
+`fcload.py` report is the subclass case above.
 
 ## Exit codes
 
@@ -188,6 +263,41 @@ Importing a `.pyt` to inspect it runs the module-level code in it and needs `arc
 That is a database connection opened at import time, a licence checked out, and a build agent
 that has to carry ArcGIS Pro. Parsing with `ast` runs none of the file, so pytlint works in CI on
 a machine with no Esri software on it.
+
+## A run on a public toolbox
+
+`ServiceSupport.pyt` in Esri's public
+[crowdsource-reporter-scripts](https://github.com/Esri/crowdsource-reporter-scripts) repository
+(Apache-2.0) is a five-tool Python toolbox. At commit `de597b5` (2023-07-26), pytlint reports 23
+findings on it and exits 1:
+
+| Code | Count | Severity |
+|---|---|---|
+| `PYT003` | 13 | warning |
+| `PYT017` | 5 | warning |
+| `PYT020` | 4 | error |
+| `PYT010` | 1 | warning |
+
+The four errors are the same handler, copied into four tools:
+
+```
+$ python pytlint.py ServiceSupport.pyt --select PYT020
+ServiceSupport.pyt:132: PYT020 error: execute catches every exception here and then neither re-raises nor reports the traceback, so the failure reaches nobody. Call traceback.format_exc() into the message and raise arcpy.ExecuteError.
+ServiceSupport.pyt:345: PYT020 error: execute catches every exception here and then neither re-raises nor reports the traceback, so the failure reaches nobody. Call traceback.format_exc() into the message and raise arcpy.ExecuteError.
+ServiceSupport.pyt:955: PYT020 error: execute catches every exception here and then neither re-raises nor reports the traceback, so the failure reaches nobody. Call traceback.format_exc() into the message and raise arcpy.ExecuteError.
+ServiceSupport.pyt:1241: PYT020 error: execute catches every exception here and then neither re-raises nor reports the traceback, so the failure reaches nobody. Call traceback.format_exc() into the message and raise arcpy.ExecuteError.
+```
+
+Each one is a bare `except` around the write of a JSON configuration file. The handler writes
+the old configuration back and calls `arcpy.AddError` with a fixed message. The tool does fail,
+because Esri documents that after `AddError`, "Upon return from your script, the calling script
+or model receives a system error and the tool stops running"
+([Writing messages in script tools](https://doc.esri.com/en/arcgis-pro/latest/arcpy/geoprocessing_and_python/writing-messages-in-script-tools.html)).
+What is lost is the exception. The message says that the update failed and does not say why.
+So "the failure reaches nobody" in the message overstates this case: the failure reaches the
+user, and the cause does not.
+
+The run reads the public upstream file only. The file is parsed, not imported, so none of it ran.
 
 ## What pylint and flake8 already do
 
@@ -201,6 +311,12 @@ set of patterns where correct Python is a broken geoprocessing tool.
 
 The ArcGIS-specific alternative is to open the toolbox in Pro and click every tool, which needs
 Pro, a licence, and a person.
+
+For `PYT024`, the alternative is argparse itself. `allow_abbrev=False` has existed since Python
+3.5, it is one keyword, and it refuses every prefix with a clear error. It does nothing until
+somebody remembers to type it on every parser and every subparser, and that is the gap the rule
+fills. `ruff rule --all` on ruff 0.16.8 lists no rule about `allow_abbrev`. pylint and flake8
+were not checked for one.
 
 ## Limits
 
@@ -231,6 +347,31 @@ Pro, a licence, and a person.
   wrapper is silent because the handler is then in the wrapper.
 - `PYT021` reads literal paths only. `sys.path.insert(0, os.path.join(ROOT, "shared"))` is
   skipped, because the value of `ROOT` is not decidable from the source.
+- `PYT006` says that the tool "still reports success, so the scheduled task wrapping it exits
+  0". That consequence did not reproduce. On arcpy 3.6 (ArcGIS Pro 3.6), a `.pyt` tool that
+  calls `arcpy.AddError` and returns was run through `arcpy.ImportToolbox`. The call raised
+  `arcpy.ExecuteError` with "Failed to execute", exactly as for a tool that raises. Esri
+  documents the same result for a script or a model that calls the tool. The Pro dialog was not
+  tested. The rule and its message are unchanged in this version, and its severity is a decision
+  that is still open.
+- `PYT003` and `PYT017` state consequences in the dialog. Esri's pages on defining a tool and
+  its parameters in a Python toolbox do not mention parameter order or `canRunInBackground`
+  (checked 2026-10-09), and neither consequence was measured here.
+- `PYT024` looks for the exact option string `--apply`. Another write flag, such as `--commit`
+  or `--apply-all`, is not checked.
+- `PYT024` follows a parser through plain names, `self.` attributes, groups, subparsers and
+  `ArgumentParser` subclasses in the same file. A parser handed to a helper function, kept in a
+  list, or built by a factory in another module is not followed and is not reported. The
+  `parents=` argument is not followed either.
+- `PYT024` reads names in source order for the whole file, not one scope at a time. Two
+  functions that each bind `ap` are read correctly, because each binding comes before its own
+  calls. An unusual order, such as a closure that uses a name bound later in the file, can be
+  read against the wrong parser.
+- `allow_abbrev=SOME_NAME` and a `**kwargs` splat are not reported, because the value is not
+  decidable from the source.
+- Branch coverage under `--self-test` is 99%: 1085 statements, none missed, and 1 of 374
+  branches partial. That branch is the false side of `if __name__ == "__main__":`, which only an
+  import reaches, and the self-test runs the file as a script.
 - No datatype checking. A `datatype` string that Pro does not recognise is not caught.
 - A clean run is not a working toolbox. This finds structural mistakes, not wrong geoprocessing.
 

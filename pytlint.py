@@ -53,6 +53,7 @@ import json
 import os
 import sys
 import tempfile
+import warnings
 
 from pathlib import Path
 
@@ -110,6 +111,8 @@ RULES = (
     ("PYT021", "warning", "sys.path is given one absolute path instead of a fallback"),
     ("PYT022", "error", "a string escape ate the backslash out of a path literal"),
     ("PYT023", "error", "a script entry point catches everything and still exits 0"),
+    ("PYT024", "warning", "a parser defines --apply without allow_abbrev=False "
+                          "(optional, reported only under --select)"),
 )
 
 # The codes that mean anything in a plain .py under --script. Everything else
@@ -117,7 +120,12 @@ RULES = (
 # false positive -- PYT012 alone is why "pytlint some_script.py" was useless.
 # This is a keep list rather than a drop list on purpose: a rule added later
 # is about a toolbox until somebody decides otherwise, and stays out of here.
-SCRIPT_CODES = ("PYT000", "PYT021", "PYT022", "PYT023")
+SCRIPT_CODES = ("PYT000", "PYT021", "PYT022", "PYT023", "PYT024")
+
+# Rules that are off unless --select names them. PYT024 is a house convention
+# for tools that write, not a defect every toolbox has, so turning it on by
+# default would add a finding to working files that never asked for it.
+OPTIONAL_CODES = ("PYT024",)
 
 RULE_SEVERITY = dict((code, severity) for code, severity, _ in RULES)
 ALL_CODES = tuple(code for code, _, _ in RULES)
@@ -414,6 +422,116 @@ def _is_bare_return(stmt):
         return False
     return stmt.value is None or (isinstance(stmt.value, ast.Constant)
                                   and stmt.value.value is None)
+
+
+# The flag that makes a tool write. Exact spelling only: --apply-all is a
+# different option, and a prefix of it is a different question.
+WRITE_FLAG = "--apply"
+
+# Calls that return an option group. An option added to a group belongs to
+# the parser the group came from, and so does that parser's allow_abbrev.
+GROUP_METHODS = ("add_argument_group", "add_mutually_exclusive_group")
+
+
+def _abbrev_guard(call):
+    """True, False, or None when the allow_abbrev value is not decidable.
+
+    None covers allow_abbrev=SOME_NAME and a **kwargs splat. Reporting either
+    one would be a guess, and this rule only reports what the source says.
+    """
+    for kw in call.keywords:
+        if kw.arg == "allow_abbrev":
+            if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
+                return not kw.value.value
+            return None
+        if kw.arg is None:
+            return None
+    return False
+
+
+def _parser_classes(tree):
+    """ArgumentParser subclasses in the file, mapped to "has its own __init__".
+
+    A tool that subclasses ArgumentParser only to override error() builds its
+    parser as _Parser(...), and a rule that knew only the name ArgumentParser
+    passed that parser while argparse read --ap as --apply. A subclass with
+    its own __init__ may pass allow_abbrev=False to super(), so its guard is
+    not decidable from the call site.
+    """
+    classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
+    found = {}
+    grew = True
+    # Repeat until nothing new is found, so a subclass of a subclass is caught
+    # whichever order the two are written in.
+    while grew:
+        grew = False
+        for cls in classes:
+            if cls.name in found:
+                continue
+            for base in cls.bases:
+                name = _dotted(base)
+                last = name.split(".")[-1] if name else None
+                if last == "ArgumentParser" or last in found:
+                    found[cls.name] = "__init__" in _methods(cls) or \
+                        found.get(last, False)
+                    grew = True
+                    break
+    return found
+
+
+def _unguarded_write_parsers(tree):
+    """(parser line, factory, --apply line) for each parser a prefix can reach.
+
+    A subparser from add_parser() is its own ArgumentParser with its own
+    allow_abbrev, so a guarded parent does not protect it. An argument group
+    is not a parser, so its options follow the parser that made it.
+
+    shortcut: names are tracked in source order across the whole file, not per
+    scope. Two functions that each bind "ap" are read correctly, because each
+    binding comes before its own add_argument calls. A parser handed to a
+    helper as an argument is not followed, and is not reported.
+    """
+    nodes = [node for node in ast.walk(tree)
+             if isinstance(node, (ast.Assign, ast.AnnAssign, ast.Call))]
+    # An Assign sorts before the Call on its own right-hand side, because the
+    # target starts further left on the same line.
+    nodes.sort(key=lambda node: (node.lineno, node.col_offset))
+    subclasses = _parser_classes(tree)
+    bound = {}
+    records = []
+    for node in nodes:
+        if not isinstance(node, ast.Call):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = [_dotted(target) for target in targets]
+            value = node.value
+            factory = _dotted(value.func) if isinstance(value, ast.Call) else None
+            last = factory.split(".")[-1] if factory else None
+            record = None
+            if last in ("ArgumentParser", "add_parser") or last in subclasses:
+                guard = _abbrev_guard(value)
+                if guard is False and subclasses.get(last):
+                    guard = None
+                record = {"line": value.lineno, "factory": last,
+                          "guard": guard, "apply": None}
+                records.append(record)
+            elif last in GROUP_METHODS and isinstance(value.func, ast.Attribute):
+                record = bound.get(_dotted(value.func.value))
+            for name in names:
+                if name is None:
+                    continue
+                if record is None:
+                    bound.pop(name, None)
+                else:
+                    bound[name] = record
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr != "add_argument":
+            continue
+        record = bound.get(_dotted(func.value))
+        if record is not None and record["apply"] is None and                 any(_string(arg) == WRITE_FLAG for arg in node.args):
+            record["apply"] = node.lineno
+    return [(r["line"], r["factory"], r["apply"]) for r in records
+            if r["apply"] is not None and r["guard"] is False]
 
 
 # ----------------------------------------------------------------- parameters
@@ -787,8 +905,14 @@ def check_source(source, script=False):
     # from a string, so leaving it here reports PYT000 on a toolbox that loads.
     if source.startswith("\ufeff"):
         source = source[1:]
+    # An invalid escape such as "\g" in the toolbox makes the compiler warn,
+    # and the warning lands on stderr as if pytlint had something to say about
+    # itself. Under python -W error it would even become a PYT000 that the
+    # file does not deserve. The file is being read, not run, so silence it.
     try:
-        tree = ast.parse(source)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(source)
     except SyntaxError as exc:
         return [Finding("PYT000", exc.lineno or 1, exc.msg or "invalid syntax")]
 
@@ -818,6 +942,19 @@ def check_source(source, script=False):
             "imports its package only on a machine where that path exists. "
             "Resolve the folder beside __file__ first and fall back to the "
             "shared copy." % literal))
+
+    # ---- a write flag a typed prefix can reach
+    # argparse reads any unique prefix of a long option as that option unless
+    # the parser says allow_abbrev=False, so "--ap" on a tool with --apply is
+    # the write, typed by somebody who meant to look first.
+    for line, factory, apply_line in _unguarded_write_parsers(tree):
+        out.append(Finding(
+            "PYT024", line,
+            "this parser defines %s at line %d and does not pass "
+            "allow_abbrev=False to %s(), so argparse reads a unique prefix "
+            "such as --ap or --app as %s, and a typed prefix makes the write. "
+            "A subparser needs its own allow_abbrev=False; the parent's does "
+            "not reach it." % (WRITE_FLAG, apply_line, factory, WRITE_FLAG)))
 
     # ---- a path literal whose backslash the parser ate
     # Every string in the file, because a path reaches arcpy from a constant,
@@ -919,8 +1056,13 @@ def check_source(source, script=False):
 
 
 def filter_findings(findings, select=None, ignore=None):
-    """Keep the selected codes, then drop the ignored ones. Ignore wins."""
-    kept = list(findings)
+    """Keep the selected codes, then drop the ignored ones. Ignore wins.
+
+    An optional code is dropped unless select names it, so check_source can
+    report everything and the default output still never carries one.
+    """
+    kept = [f for f in findings
+            if f.code not in OPTIONAL_CODES or f.code in (select or ())]
     if select:
         kept = [f for f in kept if f.code in select]
     if ignore:
@@ -1102,28 +1244,50 @@ def _silent(source, code):
 CLEAN = _pyt(GOOD_TOOL)
 
 
-def self_test():
-    """Assertions over the decision core. No arcpy, no toolbox file, no network."""
+def _harness(stream=None):
+    """check(), raises() and finish() over one tally.
+
+    A factory rather than closures inside self_test, so the self-test can run
+    a second tally and prove that a failing assertion is counted as one.
+    """
     passed = [0]
     failed = []
 
     def check(cond, label):
         if cond:
             passed[0] += 1
-            print("PASS  %s" % label)
+            print("PASS  %s" % label, file=stream)
         else:
             failed.append(label)
-            print("FAIL  %s" % label)
+            print("FAIL  %s" % label, file=stream)
 
-    def raises(fn, label):
+    def raises(fn, label, kind=ValueError):
         try:
             fn()
-        except ValueError:
+        except kind:
             check(True, label)
         except Exception as exc:
             check(False, "%s (wrong exception %r)" % (label, exc))
         else:
             check(False, "%s (no error raised)" % label)
+
+    def finish():
+        print("-" * 68, file=stream)
+        total = passed[0] + len(failed)
+        if failed:
+            print("%d assertions, %d failed" % (total, len(failed)), file=stream)
+            for item in failed:
+                print("  FAILED: %s" % item, file=stream)
+            return 1
+        print("%d assertions, 0 failed" % total, file=stream)
+        return 0
+
+    return check, raises, finish
+
+
+def self_test():
+    """Assertions over the decision core. No arcpy, no toolbox file, no network."""
+    check, raises, finish = _harness()
 
     print("pytlint self-test: no arcpy, no toolbox file, no network")
     print("-" * 68)
@@ -2117,6 +2281,232 @@ if __name__ == "__main__":
           "PYT022 is neither a script rule nor a toolbox rule, so it survives "
           "both modes")
 
+    # ---- a write flag a typed prefix can reach
+    # Each fixture below is also run for real, through the argparse on this
+    # interpreter, so the rule's verdict and the parser's behaviour are pinned
+    # side by side. These are the self-test's own sources, not a toolbox.
+    unguarded = '''import argparse
+
+
+def build():
+    ap = argparse.ArgumentParser(prog="tool")  #@
+    ap.add_argument("--apply", action="store_true")
+    return ap
+'''
+    guarded = unguarded.replace('prog="tool")', 'prog="tool", allow_abbrev=False)')
+
+    def prefix_writes(source, argv):
+        """True when argv reaches --apply through the fixture's own parser."""
+        namespace = {}
+        exec(compile(source, "<fixture>", "exec"), namespace)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                return namespace["build"]().parse_args(argv).apply is True
+        except SystemExit:
+            return False
+
+    check(_fires(unguarded, "PYT024"),
+          "a parser that defines --apply without allow_abbrev=False fires on "
+          "the parser line")
+    check(all(prefix_writes(unguarded, [prefix])
+              for prefix in ("--ap", "--app", "--appl")),
+          "that parser, run for real, reads --ap, --app and --appl as --apply")
+    check(_silent(guarded, "PYT024"),
+          "the same parser with allow_abbrev=False is silent")
+    check(not prefix_writes(guarded, ["--ap"]) and prefix_writes(guarded, ["--apply"]),
+          "the guarded parser, run for real, refuses --ap and still takes --apply")
+    message = _message_for(unguarded, "PYT024")
+    check("--apply at line %d" % (_marked(unguarded) + 1) in message
+          and "ArgumentParser()" in message,
+          "the message names the line --apply is defined on and the call to fix")
+    check(_fires(unguarded.replace('prog="tool")', 'prog="tool", allow_abbrev=True)'),
+                 "PYT024"),
+          "allow_abbrev=True written out is the default, and fires")
+    check(_silent(unguarded.replace('prog="tool")', 'prog="tool", allow_abbrev=ABBREV)'),
+                  "PYT024"),
+          "allow_abbrev given a name is not decidable, so it is not guessed at")
+    check(_silent(unguarded.replace('prog="tool")', "**PARSER_OPTIONS)"), "PYT024"),
+          "a **kwargs splat may carry the guard, so it is not guessed at")
+    check(_silent(unguarded.replace('"--apply"', '"--list"'), "PYT024"),
+          "a parser with no --apply has no write to reach, and is silent")
+    check(_silent(unguarded.replace('"--apply"', '"--apply-all"'), "PYT024"),
+          "--apply-all is a different flag, so the exact spelling is required")
+    check(_silent(unguarded.replace('ap.add_argument("--apply"',
+                                    'ap.add_argument("-a"'), "PYT024")
+          and _fires(unguarded.replace('ap.add_argument("--apply"',
+                                       'ap.add_argument("-a", "--apply"'), "PYT024"),
+          "--apply is found as the second option string of the same argument")
+    twice = unguarded.replace('    return ap\n',
+                              '    ap.add_argument("--apply", dest="again")\n'
+                              '    return ap\n')
+    check("--apply at line %d" % (_marked(twice) + 1) in _message_for(twice, "PYT024")
+          and len(_lines_for(twice, "PYT024")) == 1,
+          "--apply added twice to one parser is one finding, at the first line")
+    annotated = unguarded.replace("ap = argparse.ArgumentParser(",
+                                  "ap: argparse.ArgumentParser = argparse.ArgumentParser(")
+    check(_fires(annotated, "PYT024"),
+          "an annotated assignment binds the parser the same way")
+
+    # A subparser is an ArgumentParser of its own. Its options are parsed by
+    # it, with its own allow_abbrev, so a guarded parent does not reach it.
+    subparser = '''import argparse
+
+
+def build():
+    ap = argparse.ArgumentParser(prog="tool", allow_abbrev=False)
+    commands = ap.add_subparsers(dest="command")
+    run = commands.add_parser("run")  #@
+    run.add_argument("--apply", action="store_true")
+    return ap
+'''
+    check(_fires(subparser, "PYT024"),
+          "a subparser that defines --apply fires, even under a guarded "
+          "parent  <-- pinned defect")
+    check(prefix_writes(subparser, ["run", "--ap"]),
+          "and run for real, the guarded parent does not stop run --ap from "
+          "reaching --apply")
+    sub_guarded = subparser.replace('add_parser("run")',
+                                    'add_parser("run", allow_abbrev=False)')
+    check(_silent(sub_guarded, "PYT024")
+          and not prefix_writes(sub_guarded, ["run", "--ap"]),
+          "allow_abbrev=False on add_parser itself is the fix, run for real")
+    check("add_parser()" in _message_for(subparser, "PYT024"),
+          "the message names add_parser, which is where the fix goes")
+
+    # A group is not a parser. Its options are parsed by the parser that made
+    # it, so that parser's allow_abbrev is the one that counts.
+    grouped = '''import argparse
+
+
+def build():
+    ap = argparse.ArgumentParser(prog="tool")  #@
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true")
+    mode.add_argument("--dry-run", action="store_true")
+    return ap
+'''
+    check(_fires(grouped, "PYT024") and prefix_writes(grouped, ["--ap"]),
+          "--apply inside a mutually exclusive group is reported on the parser "
+          "that owns the group, and run for real the prefix reaches it")
+    grouped_safe = grouped.replace('prog="tool")', 'prog="tool", allow_abbrev=False)')
+    check(_silent(grouped_safe, "PYT024")
+          and not prefix_writes(grouped_safe, ["--ap"]),
+          "the guard on the owning parser covers the group, run for real")
+    check(_fires(grouped.replace("add_mutually_exclusive_group()",
+                                 'add_argument_group("write")'), "PYT024"),
+          "an argument group is read the same way")
+
+    on_self = '''import argparse
+
+
+class Tool(object):
+    def __init__(self):
+        self.parser = argparse.ArgumentParser()  #@
+        self.parser.add_argument("--apply", action="store_true")
+'''
+    check(_fires(on_self, "PYT024"),
+          "a parser held on self.parser is followed like a plain name")
+
+    # The shape the first version of this rule passed: a subclass that only
+    # changes error(), built under its own name. Found by running the rule
+    # over real tools from before they were fixed.
+    subclassed = '''import argparse
+
+
+def build():
+    ap = _Parser(prog="tool")  #@
+    ap.add_argument("--apply", action="store_true")
+    return ap
+
+
+class _Base(argparse.ArgumentParser):
+    pass
+
+
+class _Parser(_Base):
+    def error(self, message):
+        raise SystemExit(message)
+'''
+    check(_fires(subclassed, "PYT024") and prefix_writes(subclassed, ["--ap"]),
+          "a parser built from an ArgumentParser subclass fires, and run for "
+          "real it reads --ap as --apply  <-- pinned defect")
+    check("_Parser()" in _message_for(subclassed, "PYT024"),
+          "the message names the subclass, which is the call to fix")
+    base_class = "class _Base(argparse.ArgumentParser):\n    pass\n"
+    base_last = subclassed.replace(base_class + "\n\n", "") + "\n\n" + base_class
+    check(base_last.index("_Base(arg") > base_last.index("_Parser(_Base)")
+          and _fires(base_last, "PYT024"),
+          "a subclass of a subclass is found when the base is written last")
+    sub_safe = subclassed.replace('_Parser(prog="tool")',
+                                  '_Parser(prog="tool", allow_abbrev=False)')
+    check(_silent(sub_safe, "PYT024") and not prefix_writes(sub_safe, ["--ap"]),
+          "allow_abbrev=False passed to the subclass is the fix, run for real")
+    own_init = subclassed.replace("    pass\n",
+                                  "    def __init__(self, **kw):\n"
+                                  "        kw['allow_abbrev'] = False\n"
+                                  "        super().__init__(**kw)\n")
+    check(_silent(own_init, "PYT024") and not prefix_writes(own_init, ["--ap"]),
+          "a subclass with its own __init__ may set the guard there, so its "
+          "call site is not reported, and this one does refuse --ap")
+
+    # Names are tracked in source order, so a later binding replaces an
+    # earlier one. Each of these is a shape a real file holds.
+    rebound = '''import argparse
+
+
+def first():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--list")
+
+
+def second():
+    ap = argparse.ArgumentParser(allow_abbrev=False)
+    ap.add_argument("--apply")
+'''
+    check(_silent(rebound, "PYT024"),
+          "two functions that each bind ap are each read against their own "
+          "parser")
+    handed_off = '''import argparse
+
+
+def build():
+    ap = argparse.ArgumentParser()
+    ap = wrap(ap)
+    ap.add_argument("--apply")
+    shared = [argparse.ArgumentParser()]
+    shared[0] = argparse.ArgumentParser()
+    shared[0].add_argument("--apply")
+    group = add_argument_group("loose")
+    group.add_argument("--apply")
+    add_argument("--apply")
+'''
+    check(_silent(handed_off, "PYT024"),
+          "a name rebound to something else, a parser in a list, and calls "
+          "that are not methods of a known parser are not guessed at")
+
+    check(RULE_SEVERITY["PYT024"] == "warning",
+          "PYT024 is a warning, because a missing guard breaks nothing until "
+          "somebody types the prefix")
+    check(set(OPTIONAL_CODES) <= set(ALL_CODES) and "PYT024" in SCRIPT_CODES,
+          "the optional code is a real rule and survives --script")
+    gated = check_source(unguarded, script=True)
+    check([f.code for f in gated] == ["PYT024"]
+          and filter_findings(gated) == []
+          and filter_findings(gated, select={"PYT024"}) == gated
+          and filter_findings(gated, select={"PYT024"}, ignore={"PYT024"}) == [],
+          "an optional finding is dropped unless --select names it, and "
+          "--ignore still wins")
+
+    # ---- the file is read, not compiled for running
+    escaped = _pyt(GOOD_TOOL.replace('self.label = "Demo tool"',
+                                     'self.label = "Demo \\gtool"'))
+    with warnings.catch_warnings(record=True) as heard:
+        warnings.simplefilter("always")
+        escaped_findings = check_source(escaped)
+    check(heard == [] and escaped_findings == [],
+          "an invalid escape in the toolbox raises no compiler warning on "
+          "stderr and is not a finding  <-- pinned defect")
+
     # ---- the renderers
     finding = check_source(bad_index)[0]
     check(finding.as_dict()["code"] == finding.code
@@ -2135,12 +2525,23 @@ if __name__ == "__main__":
           "a parameter prints its own name and type")
 
     # ---- the harness itself
-    try:
-        _marked("x = 1\n")
-        marker_guarded = False
-    except AssertionError:
-        marker_guarded = True
-    check(marker_guarded, "a test source with no marker is refused by the harness")
+    raises(lambda: _marked("x = 1\n"),
+           "a test source with no marker is refused by the harness", AssertionError)
+    # A second tally, fed one failure of each kind. If a failing assertion
+    # were not counted, a red self-test could still print "0 failed".
+    inner = io.StringIO()
+    inner_check, inner_raises, inner_finish = _harness(inner)
+    inner_check(True, "kept")
+    inner_check(False, "a false condition")
+    inner_raises(lambda: None, "nothing raised")
+    inner_raises(lambda: 1 // 0, "the wrong exception")
+    inner_status = inner_finish()
+    report = inner.getvalue()
+    check(inner_status == 1 and "4 assertions, 3 failed" in report
+          and "FAIL  a false condition" in report
+          and "FAILED: nothing raised (no error raised)" in report
+          and "FAILED: the wrong exception (wrong exception" in report,
+          "a failing assertion is counted as failed, and the footer says so")
 
     # ---- a credential in the toolbox stays in the toolbox
     # A .pyt with a hard-coded password in it is depressingly common, and the
@@ -2406,15 +2807,19 @@ class Toolbox(object):
         check(_run([bom_file])[0] == 0,
               "a toolbox saved with a byte order mark still reads as clean")
 
-    print("-" * 68)
-    total = passed[0] + len(failed)
-    if failed:
-        print("%d assertions, %d failed" % (total, len(failed)))
-        for item in failed:
-            print("  FAILED: %s" % item)
-        return 1
-    print("%d assertions, 0 failed" % total)
-    return 0
+        # ---- the optional rule, through main
+        writer = write("writer.py", unguarded)
+        status, out, err = _run([writer, "--script"])
+        check(status == 0 and "nothing to report" in out,
+              "PYT024 stays out of the default output, because it is optional")
+        status, out, err = _run([writer, "--script", "--select", "PYT024"])
+        check(status == 0 and out.startswith(writer + ":%d: PYT024 warning:"
+                                             % _marked(unguarded)),
+              "--select PYT024 turns it on, as a warning that exits 0")
+        check(_run([writer, "--script", "--select", "PYT024", "--strict"])[0] == 1,
+              "--select PYT024 --strict is the gate that fails a build on it")
+
+    return finish()
 
 
 # ------------------------------------------------------------------------ cli
@@ -2432,7 +2837,7 @@ def _parse(argv):
     ap.add_argument("--script", action="store_true",
                     help="the paths are plain .py entry points, not toolboxes. "
                          "Drops every Toolbox rule and keeps PYT000, PYT021, "
-                         "PYT022 and PYT023.")
+                         "PYT022, PYT023 and the optional PYT024.")
     ap.add_argument("--json", action="store_true",
                     help="machine readable output on stdout")
     ap.add_argument("--select",
@@ -2511,5 +2916,7 @@ def main(argv=None):
     return status
 
 
+# ponytail: the false branch of this guard is an import, and --self-test runs
+# the file as a script, so coverage reports this one branch partial.
 if __name__ == "__main__":
     sys.exit(main())
